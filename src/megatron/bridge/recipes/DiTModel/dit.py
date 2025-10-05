@@ -15,6 +15,8 @@
 import os
 from typing import List, Optional, Union
 
+from megatron.bridge.data.Dit.data.diffusion_energon_datamodule import DiffusionDataModule
+from megatron.bridge.data.Dit.data.diffusion_taskencoder import BasicDiffusionTaskEncoder
 from megatron.bridge.models.DiTModel.dit_provider import DiTModelProvider
 import torch
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -191,22 +193,14 @@ def pretrain_config(
             use_distributed_optimizer=True,
             use_megatron_fsdp=use_megatron_fsdp,  # need use_distributed_optimizer=True
         ),
-        dataset=GPTDatasetConfig(
-            random_seed=1234,
-            reset_attention_mask=False,
-            reset_position_ids=False,
-            eod_mask_loss=False,
-            sequence_length=seq_length,
-            num_dataset_builder_threads=1,
-            blend=blend,
-            blend_per_split=blend_per_split,
-            split=split,
-            # Dataloader config parameters
-            data_sharding=True,
-            dataloader_type="single",
-            num_workers=8,
-            skip_getting_attention_mask_from_dataset=True,
-        ),
+        dataset= DiffusionDataModule(
+            path="/workspace/VFM/butterfly_webdataset",
+            seq_length=2048,
+            task_encoder=BasicDiffusionTaskEncoder(seq_length=2048),
+            micro_batch_size=1,
+            global_batch_size=2,
+            num_workers=10)
+        ,
         logger=LoggerConfig(
             log_interval=10,
             tensorboard_dir=tensorboard_dir,

@@ -78,11 +78,11 @@ def pretrain_config(
     per_split_data_args_path: Optional[str] = None,
     mock: bool = False,
     # Model configuration
-    tensor_parallelism: int = 1,
+    tensor_parallelism: int = 2,
     pipeline_parallelism: int = 1,
     pipeline_parallelism_dtype: Optional[torch.dtype] = None,
     virtual_pipeline_parallelism: Optional[int] = None,
-    context_parallelism: int = 2,
+    context_parallelism: int = 1,
     sequence_parallelism: bool = False,
     use_megatron_fsdp: bool = False,
     # Training hyperparameters

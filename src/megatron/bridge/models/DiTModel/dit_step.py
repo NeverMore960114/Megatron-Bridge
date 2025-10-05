@@ -99,7 +99,7 @@ class DITForwardStep:
         self.diffusion_pipeline = EDMPipeline(net=self, sigma_data=self.config.sigma_data)
 
 
-    def forward_step(
+    def __call__(
         self, state: GlobalState, data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False
     ) -> tuple[torch.Tensor, partial]:
         """Forward training step.
@@ -126,23 +126,7 @@ class DITForwardStep:
                 qkv_format, data_iterator
             )
         timers("batch-generator").stop()
-
-        forward_args = {
-            "input_ids": tokens,
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-        # Add packed sequence support
-        if cu_seqlens is not None:
-            packed_seq_params = {
-                "cu_seqlens": cu_seqlens,
-                "cu_seqlens_argmin": cu_seqlens_argmin,
-                "max_seqlen": max_seqlen,
-            }
-            forward_args["packed_seq_params"] = get_packed_seq_params(packed_seq_params)
-
+        
         check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
         check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
 
@@ -154,12 +138,17 @@ class DITForwardStep:
             else:
                 output_tensor = self.diffusion_pipeline.training_step(batch, 0)
 
-        loss_function = _create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+        if "loss_mask" not in batch or batch["loss_mask"] is None:
+            loss_mask = torch.ones_like(loss)
+        loss_mask = batch["loss_mask"]
+        
+
+        loss_function = self._create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
 
         return output_tensor, loss_function
 
 
-    def _create_loss_function(loss_mask: torch.Tensor, check_for_nan_in_loss: bool, check_for_spiky_loss: bool) -> partial:
+    def _create_loss_function(self, loss_mask: torch.Tensor, check_for_nan_in_loss: bool, check_for_spiky_loss: bool) -> partial:
         """Create a partial loss function with the specified configuration.
 
         Args:
