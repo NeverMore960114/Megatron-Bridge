@@ -29,9 +29,10 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_sharded_tensor_for_checkpoint
-from nemo_vfm.diffusion.models.dit import dit_embeddings
-from nemo_vfm.diffusion.models.dit.dit_embeddings import ParallelTimestepEmbedding
-from nemo_vfm.diffusion.models.dit.dit_layer_spec import (
+
+from megatron.bridge.models.DiTModel.dit_embeddings import ParallelTimestepEmbedding
+from megatron.bridge.models.DiTModel import dit_embeddings
+from megatron.bridge.models.DiTModel.dit_layer_spec import (
     get_dit_adaln_block_with_transformer_engine_spec as DiTLayerWithAdaLNspec,
 )
 from torch import Tensor

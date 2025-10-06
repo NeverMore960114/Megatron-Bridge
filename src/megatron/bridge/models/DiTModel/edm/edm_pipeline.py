@@ -18,9 +18,9 @@ import numpy as np
 import torch
 import torch.distributed
 from megatron.core import parallel_state
-from nemo_vfm.diffusion.sampler.batch_ops import batch_mul
-from nemo_vfm.diffusion.sampler.context_parallel import cat_outputs_cp
-from nemo_vfm.diffusion.sampler.edm.edm import EDMSDE, EDMSampler, EDMScaling
+from megatron.bridge.models.DiTModel.sampler.batch_ops import batch_mul
+from megatron.bridge.models.DiTModel.sampler.context_parallel import cat_outputs_cp
+from megatron.bridge.models.DiTModel.edm.edm import EDMSDE, EDMSampler, EDMScaling
 from torch import Tensor
 
 

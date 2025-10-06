@@ -139,30 +139,30 @@ def main() -> None:
     if get_rank_safe() == 0:
         cfg.print_yaml()
 
-    # Convert the initial Python dataclass to an OmegaConf DictConfig for merging
-    merged_omega_conf, excluded_fields = create_omegaconf_dict_config(cfg)
+    # # Convert the initial Python dataclass to an OmegaConf DictConfig for merging
+    # merged_omega_conf, excluded_fields = create_omegaconf_dict_config(cfg)
 
-    # Load and merge YAML overrides if a config file is provided
-    if args.config_file:
-        logger.debug(f"Loading YAML overrides from: {args.config_file}")
-        if not os.path.exists(args.config_file):
-            logger.error(f"Override YAML file not found: {args.config_file}")
-            sys.exit(1)
-        yaml_overrides_omega = OmegaConf.load(args.config_file)
-        merged_omega_conf = OmegaConf.merge(merged_omega_conf, yaml_overrides_omega)
-        logger.debug("YAML overrides merged successfully.")
+    # # Load and merge YAML overrides if a config file is provided
+    # if args.config_file:
+    #     logger.debug(f"Loading YAML overrides from: {args.config_file}")
+    #     if not os.path.exists(args.config_file):
+    #         logger.error(f"Override YAML file not found: {args.config_file}")
+    #         sys.exit(1)
+    #     yaml_overrides_omega = OmegaConf.load(args.config_file)
+    #     merged_omega_conf = OmegaConf.merge(merged_omega_conf, yaml_overrides_omega)
+    #     logger.debug("YAML overrides merged successfully.")
 
-    # Apply command-line overrides using Hydra-style parsing
-    if cli_overrides:
-        logger.debug(f"Applying Hydra-style command-line overrides: {cli_overrides}")
-        merged_omega_conf = parse_hydra_overrides(merged_omega_conf, cli_overrides)
-        logger.debug("Hydra-style command-line overrides applied successfully.")
+    # # Apply command-line overrides using Hydra-style parsing
+    # if cli_overrides:
+    #     logger.debug(f"Applying Hydra-style command-line overrides: {cli_overrides}")
+    #     merged_omega_conf = parse_hydra_overrides(merged_omega_conf, cli_overrides)
+    #     logger.debug("Hydra-style command-line overrides applied successfully.")
 
-    # Apply the final merged OmegaConf configuration back to the original ConfigContainer
-    logger.debug("Applying final merged configuration back to Python ConfigContainer...")
-    final_overrides_as_dict = OmegaConf.to_container(merged_omega_conf, resolve=True)
-    # Apply overrides while preserving excluded fields
-    apply_overrides(cfg, final_overrides_as_dict, excluded_fields)
+    # # Apply the final merged OmegaConf configuration back to the original ConfigContainer
+    # logger.debug("Applying final merged configuration back to Python ConfigContainer...")
+    # final_overrides_as_dict = OmegaConf.to_container(merged_omega_conf, resolve=True)
+    # # Apply overrides while preserving excluded fields
+    # apply_overrides(cfg, final_overrides_as_dict, excluded_fields)
 
     # Display final configuration
     if get_rank_safe() == 0:

@@ -147,8 +147,7 @@ class DiTModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
 
     bf16: bool = True
     params_dtype: torch.dtype = torch.bfloat16
-
-    vae_module: str = "nemo_vfm.diffusion.vae.diffusers_vae.AutoencoderKLVAE"
+    vae_module: str = "megatron.bridge.models.DiTModel.diffusers_vae.AutoencoderKLVAE"
     vae_path: str = None
     sigma_data: float = 0.5
 
@@ -160,6 +159,8 @@ class DiTModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
 
     replicated_t_embedder = True
     qkv_format: str = 'sbhd'
+    seq_length: int = 1024
+    vocab_size: int = None
 
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> DiTCrossAttentionModel:

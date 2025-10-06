@@ -16,11 +16,12 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import Literal, Optional, Union
 
 import torch
 import torch.nn as nn
 from megatron.core.jit import jit_fuser
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import (
     CrossAttention,
     CrossAttentionSubmodules,
@@ -43,8 +44,7 @@ from megatron.core.transformer.transformer_block import TransformerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import make_viewless_tensor
-from nemo_vfm.diffusion.models.dit.dit_attention import (
-    FluxSingleAttention,
+from megatron.bridge.models.DiTModel.dit_attention import (
     JointSelfAttention,
     JointSelfAttentionSubmodules,
 )
@@ -346,6 +346,8 @@ class DiTLayerWithAdaLN(TransformerLayer):
         layer_number: int = 1,
         hidden_dropout: float = None,
         position_embedding_type: Literal["learned_absolute", "rope"] = "learned_absolute",
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
     ):
         def _replace_no_cp_submodules(submodules):
             modified_submods = copy.deepcopy(submodules)
@@ -775,8 +777,9 @@ def get_dit_adaln_block_with_transformer_engine_spec() -> ModuleSpec:
                     linear_kv=TEColumnParallelLinear,
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
-                    q_layernorm=RMSNorm,
-                    k_layernorm=RMSNorm,
+                    # Cross attention no longer is supports q and k layernorms
+                    # q_layernorm=RMSNorm,
+                    # k_layernorm=RMSNorm,
                 ),
             ),
             mlp=ModuleSpec(

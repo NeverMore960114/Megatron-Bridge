@@ -20,6 +20,7 @@ from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
+from megatron.bridge.training.setup import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -711,3 +712,32 @@ def maybe_inject_state(
         return partial(forward_step_func, state)
     else:
         return forward_step_func
+
+
+def check_forward_step_func_num_args(forward_step_func: Callable) -> int:
+    """Check if the forward step function has a supported number of arguments.
+
+    Currently supports 2, 3, or 4 arguments:
+    - func(data_iterator, model)
+    - func(data_iterator, model, return_schedule_plan: bool = False)  # state pre-bound via partial
+    - func(state, data_iterator, model, return_schedule_plan: bool = False)
+
+    Args:
+        forward_step_func: The function to check.
+
+    Returns:
+        The number of arguments the function takes.
+
+    Raises:
+        AssertionError: If the function does not have 2 or 4 arguments.
+    """
+    num_fw_args = len(inspect.signature(forward_step_func).parameters)
+    fail_msg = f"""
+    forward_step_func has {num_fw_args} arguments. Only the following signatures are supported:
+        2 args: forward_step_func(data_iterator: Iterable, model: GPTModel)
+        3 args: forward_step_func(data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False)
+        4 args: forward_step_func(state: GlobalState, data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False)
+    """
+    assert num_fw_args in (2, 3, 4), fail_msg
+
+    return num_fw_args

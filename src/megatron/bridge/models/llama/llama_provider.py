@@ -180,7 +180,7 @@ class Llama3ModelProvider8B(Llama3ModelProvider):
 
     rotary_base: int = 500_000
     seq_length: int = 8192
-    num_layers: int = 32
+    num_layers: int = 2
     hidden_size: int = 4096
     ffn_hidden_size: int = 14336
     num_attention_heads: int = 32

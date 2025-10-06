@@ -15,7 +15,7 @@
 import os
 from typing import List, Optional, Union
 
-from megatron.bridge.data.Dit.data.diffusion_energon_datamodule import DiffusionDataModule
+from megatron.bridge.data.Dit.data.diffusion_energon_datamodule import DiffusionDataModule, DiffusionDataModuleConfig
 from megatron.bridge.data.Dit.data.diffusion_taskencoder import BasicDiffusionTaskEncoder
 from megatron.bridge.models.DiTModel.dit_provider import DiTModelProvider
 import torch
@@ -64,9 +64,10 @@ def model_config(
         tensor_model_parallel_size=tensor_parallelism,
         pipeline_model_parallel_size=pipeline_parallelism,
         pipeline_dtype=pipeline_parallelism_dtype,
-        virtual_pipeline_model_parallel_size=virtual_pipeline_parallelism,
+        virtual_pipeline_model_parallel_size=None,
         context_parallel_size=context_parallelism,
         sequence_parallel=sequence_parallelism,
+        seq_length=2048
     )
 
 
@@ -91,7 +92,7 @@ def pretrain_config(
     use_megatron_fsdp: bool = False,
     # Training hyperparameters
     train_iters: int = 10000,
-    global_batch_size: int = 1,
+    global_batch_size: int = 2,
     micro_batch_size: int = 1,
     lr: float = 0.9e-4,
     lr_warmup_iters: int = 2000,
@@ -160,14 +161,6 @@ def pretrain_config(
 
     precision_config.grad_reduce_in_fp32 = False
 
-    if comm_overlap_config is None:
-        comm_overlap_config = CommOverlapConfig(
-            tp_comm_overlap=True,
-            tp_comm_overlap_cfg=userbuffers_bf16_h100_h12288_tp4_mbs1_seqlen2048,
-            defer_embedding_wgrad_compute=True,
-            wgrad_deferral_limit=50,
-            overlap_param_gather_with_optimizer_step=False,  # Currently disabled to an issue with async checkpointing
-        )
 
     # Config Container
     cfg = ConfigContainer(
@@ -193,12 +186,12 @@ def pretrain_config(
             use_distributed_optimizer=True,
             use_megatron_fsdp=use_megatron_fsdp,  # need use_distributed_optimizer=True
         ),
-        dataset= DiffusionDataModule(
-            path="/workspace/VFM/butterfly_webdataset",
+        dataset= DiffusionDataModuleConfig(
+            path="/opt/VFM/butterfly_webdataset",
             seq_length=2048,
-            task_encoder=BasicDiffusionTaskEncoder(seq_length=2048),
-            micro_batch_size=1,
-            global_batch_size=2,
+            task_encoder_seq_length=2048,
+            micro_batch_size=micro_batch_size,
+            global_batch_size=global_batch_size,
             num_workers=10)
         ,
         logger=LoggerConfig(

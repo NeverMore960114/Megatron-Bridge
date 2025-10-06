@@ -168,9 +168,7 @@ class EnergonMultiModalDataModule:
         Returns:
         TRAIN_DATALOADERS: The DataLoader for the training dataset.
         """
-        if self.trainer:
-            self.init_global_step = self.trainer.global_step
-        self.data_sampler.init_global_step = self.init_global_step
+
         logger.info(f"Multimodal train dataloader initializing with init_global_step {self.init_global_step}")
         if self.train_dataloader_object:
             return self.train_dataloader_object

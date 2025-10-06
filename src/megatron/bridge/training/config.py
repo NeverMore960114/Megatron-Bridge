@@ -20,6 +20,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple, Union
 
+import torch
+
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.distributed import DistributedDataParallelConfig as MCoreDistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig as MCoreOptimizerConfig
@@ -1160,7 +1162,10 @@ class ConfigContainer(Container):
                 if isinstance(self.dataset, FinetuningDatasetConfig)
                 else self.dataset.sequence_length
             )
-
+            # Place pdb on rank 0
+            # import pdb;pdb.set_trace()
+            # if torch.distributed.get_rank() == 0:
+            #     import pdb; pdb.set_trace()
             assert self.model.seq_length == data_seq_length, (
                 f"Please ensure sequence length configuration in model config and "
                 f"dataset config match.\nSequence length in model config: {self.model.seq_length}, "
