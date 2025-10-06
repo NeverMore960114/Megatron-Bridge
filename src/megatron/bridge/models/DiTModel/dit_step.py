@@ -31,7 +31,8 @@ from megatron.bridge.training.state import GlobalState
 logger = logging.getLogger(__name__)
 
 def dit_data_step(qkv_format, dataloader_iter):
-    batch = next(dataloader_iter)[0]
+    # import pdb;pdb.set_trace()
+    batch = next(iter(dataloader_iter.iterable))
     batch = get_batch_on_this_cp_rank(batch)
     batch = {k: v.to(device="cuda", non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
     batch["is_preprocessed"] = True  # assume data is preprocessed
@@ -96,7 +97,7 @@ def get_batch_on_this_cp_rank(data):
 
 class DITForwardStep:
     def __init__(self):
-        self.diffusion_pipeline = EDMPipeline(net=self, sigma_data=self.config.sigma_data)
+        self.diffusion_pipeline = EDMPipeline(sigma_data=0.5)
 
 
     def __call__(
@@ -129,21 +130,22 @@ class DITForwardStep:
         
         check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
         check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
-
+        # import pdb;pdb.set_trace()
         with straggler_timer:
             if parallel_state.is_pipeline_last_stage():
-                output_batch, loss = self.diffusion_pipeline.training_step(batch, 0)
-                loss = torch.mean(loss, dim=-1)
-                return loss
+                output_batch, loss = self.diffusion_pipeline.training_step(model, batch, 0)
+                output_tensor = torch.mean(loss, dim=-1)
             else:
-                output_tensor = self.diffusion_pipeline.training_step(batch, 0)
+                output_tensor = self.diffusion_pipeline.training_step(model, batch, 0)
 
+        loss = output_tensor
         if "loss_mask" not in batch or batch["loss_mask"] is None:
             loss_mask = torch.ones_like(loss)
         loss_mask = batch["loss_mask"]
         
 
         loss_function = self._create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+
 
         return output_tensor, loss_function
 

@@ -67,7 +67,6 @@ class EDMPipeline:
 
     def __init__(
         self,
-        net,
         vae=None,
         p_mean=0.0,
         p_std=1.0,
@@ -110,7 +109,6 @@ class EDMPipeline:
             loss_scale (float): Scale factor for loss.
         """
         self.vae = vae
-        self.net = net
 
         self.p_mean = p_mean
         self.p_std = p_std
@@ -161,7 +159,7 @@ class EDMPipeline:
         self.sde._generator = self._noise_level_generator
 
     def training_step(
-        self, data_batch: dict[str, torch.Tensor], iteration: int
+        self, model, data_batch: dict[str, torch.Tensor], iteration: int
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
         Performs a single training step for the diffusion model.
@@ -180,6 +178,7 @@ class EDMPipeline:
         """
         # import pdb; pdb.set_trace()
         # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
+        self.net = model
         x0_from_data_batch, x0, condition = self.get_data_and_condition(data_batch)
 
         # Sample pertubation noise levels and N(0, 1) noises

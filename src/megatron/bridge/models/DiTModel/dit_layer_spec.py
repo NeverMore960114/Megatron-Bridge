@@ -259,6 +259,8 @@ class STDiTLayerWithAdaLN(TransformerLayer):
             scale=scale_full,
         )
 
+        # import pdb;pdb.set_trace()
+
         attention_output, _ = self.full_self_attention(
             pre_full_attn_layernorm_output_ada,
             attention_mask=None,
@@ -368,6 +370,7 @@ class DiTLayerWithAdaLN(TransformerLayer):
             cp_override_config = copy.deepcopy(config)
             cp_override_config.context_parallel_size = 1
             cp_override_config.tp_comm_overlap = False
+            # import pdb;pdb.set_trace()
             self.cross_attention = build_module(
                 submodules.cross_attention,
                 config=cp_override_config,
@@ -397,6 +400,7 @@ class DiTLayerWithAdaLN(TransformerLayer):
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
+        inference_context=None
     ):
         # timestep embedding
         timestep_emb = attention_mask
@@ -415,7 +419,7 @@ class DiTLayerWithAdaLN(TransformerLayer):
         pre_full_attn_layernorm_output_ada = self.adaLN.modulated_layernorm(
             hidden_states, shift=shift_full, scale=scale_full
         )
-
+        # import pdb;pdb.set_trace()
         attention_output, _ = self.full_self_attention(
             pre_full_attn_layernorm_output_ada,
             attention_mask=None,

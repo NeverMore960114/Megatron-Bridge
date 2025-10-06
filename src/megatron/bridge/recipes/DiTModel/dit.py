@@ -92,8 +92,8 @@ def pretrain_config(
     use_megatron_fsdp: bool = False,
     # Training hyperparameters
     train_iters: int = 10000,
-    global_batch_size: int = 2,
-    micro_batch_size: int = 1,
+    global_batch_size: int = 4,
+    micro_batch_size: int = 2,
     lr: float = 0.9e-4,
     lr_warmup_iters: int = 2000,
     # Precision recipe
@@ -180,8 +180,8 @@ def pretrain_config(
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=True,
-            overlap_grad_reduce=True,
-            overlap_param_gather=True,
+            overlap_grad_reduce=False,
+            overlap_param_gather=False,
             average_in_collective=True,
             use_distributed_optimizer=True,
             use_megatron_fsdp=use_megatron_fsdp,  # need use_distributed_optimizer=True

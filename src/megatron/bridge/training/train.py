@@ -524,6 +524,7 @@ def train_step(
 
         # Forward pass.
         forward_backward_func = get_forward_backward_func()
+        # import pdb;pdb.set_trace()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,

@@ -172,7 +172,7 @@ def main() -> None:
 
     # Start training
     logger.debug("Starting pretraining...")
-    pretrain(config=cfg, forward_step_func=DITForwardStep)
+    pretrain(config=cfg, forward_step_func=DITForwardStep())
 
 
 if __name__ == "__main__":

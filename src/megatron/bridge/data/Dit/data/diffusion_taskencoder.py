@@ -95,7 +95,7 @@ class BasicDiffusionTaskEncoder(DefaultTaskEncoder):
         info = sample["json"]
         # remove batch dimension
         video_latent = video_latent.squeeze(0)
-        print(f"video_latent shape at start: {video_latent.shape}")
+        # print(f"video_latent shape at start: {video_latent.shape}")
         C, T, H, W = video_latent.shape
         seq_len = (
             video_latent.shape[-1]
@@ -121,7 +121,7 @@ class BasicDiffusionTaskEncoder(DefaultTaskEncoder):
         # if (T * H * W) % tpcp_size != 0:
         #     warnings.warn(f'skipping {video_latent.shape=} not divisible by {tpcp_size=}')
         #     raise SkipSample()
-        print(f"video_latent shape before rearrange: {video_latent.shape}")
+        # print(f"video_latent shape before rearrange: {video_latent.shape}")
         # video_latent shape before rearrange: torch.Size([16, 1, 64, 96])
         video_latent = rearrange(
             video_latent,
@@ -130,7 +130,7 @@ class BasicDiffusionTaskEncoder(DefaultTaskEncoder):
             pw=self.patch_spatial,
             pt=self.patch_temporal,
         )
-        print(f"video_latent shape after rearrange: {video_latent.shape}")
+        # print(f"video_latent shape after rearrange: {video_latent.shape}")
         # After reaaranging: video_latent shape after rearrange: torch.Size([1536, 64])
         # convert sample["pickle"] to numpy, and remove batch dimension
         sample["pickle"] = sample["pickle"].cpu().float().numpy().squeeze(0)

@@ -125,7 +125,7 @@ class DiTModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
     gated_linear_unit: bool = False
 
     num_layers: int = 12
-    hidden_size: int = 384
+    hidden_size: int = 1024
     max_img_h: int = 80
     max_img_w: int = 80
     max_frames: int = 34
@@ -161,6 +161,7 @@ class DiTModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
     qkv_format: str = 'sbhd'
     seq_length: int = 1024
     vocab_size: int = None
+    make_vocab_size_divisible_by: int = 128
 
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> DiTCrossAttentionModel:
