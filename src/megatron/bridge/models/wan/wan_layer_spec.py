@@ -1,0 +1,674 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pylint: disable=C0115,C0116,C0301
+
+import copy
+from dataclasses import dataclass
+from typing import Union, Optional
+
+import torch
+import torch.cuda.amp as amp
+import torch.nn as nn
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.transformer.attention import (
+    CrossAttention,
+    CrossAttentionSubmodules,
+    SelfAttention,
+    SelfAttentionSubmodules,
+)
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TERowParallelLinear,
+)
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import make_viewless_tensor
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.extensions.transformer_engine import TENorm
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+    from megatron.core.extensions.transformer_engine import SplitAlongDim
+    
+except ImportError:
+    HAVE_TE = False
+    SplitAlongDim = None
+
+
+class WanLayerNorm(nn.LayerNorm):
+
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+
+    def forward(self, x):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, C]
+        """
+        return super().forward(x.float()).type_as(x)
+
+
+@dataclass
+class WanSelfAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a self-attention.
+    """
+
+    linear_qkv: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
+    layernorm_across_head: bool = False
+    q_layernorm: Union[ModuleSpec, type] = None
+    k_layernorm: Union[ModuleSpec, type] = None
+
+
+@dataclass
+class WanCrossAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a cross-attention.
+    """
+    linear_q: Union[ModuleSpec, type] = None
+    linear_kv: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
+    layernorm_across_head: bool = False
+    q_layernorm: Union[ModuleSpec, type] = None
+    k_layernorm: Union[ModuleSpec, type] = None
+
+
+class WanSelfAttention(SelfAttention):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: WanSelfAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        cp_comm_type: str = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(
+            config,
+            submodules,
+            layer_number,
+            attn_mask_type,
+            cp_comm_type,
+            pg_collection,
+        )
+
+        self.layernorm_across_head = submodules.layernorm_across_head
+
+        # override q_layernorm
+        if submodules.q_layernorm is not None:
+            if self.layernorm_across_head:
+                q_layernorm_size = self.query_projection_size
+            else:
+                q_layernorm_size = self.hidden_size_per_attention_head
+            import transformer_engine as te
+            norm_config = copy.deepcopy(self.config)
+            norm_config.normalization = "RMSNorm"
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                eps=1e-6,
+                hidden_size=q_layernorm_size,
+                config=norm_config,
+            )
+        else:
+            self.q_layernorm = None
+
+        # override k_layernorm
+        if submodules.k_layernorm is not None:
+            if self.layernorm_across_head:
+                k_layernorm_size = self.kv_projection_size
+            else:
+                k_layernorm_size = self.hidden_size_per_attention_head
+            import transformer_engine as te
+            norm_config = copy.deepcopy(self.config)
+            norm_config.normalization = "RMSNorm"
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                eps=1e-6,
+                hidden_size=k_layernorm_size,
+                config=norm_config,
+            )
+        else:
+            self.k_layernorm = None
+
+    def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+        """
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        """
+        # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        new_tensor_shape = mixed_qkv.size()[:-1] + (
+            self.num_query_groups_per_partition,
+            (
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                * self.hidden_size_per_attention_head
+            ),
+        )
+        mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+
+        split_arg_list = [
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            self.hidden_size_per_attention_head,
+            self.hidden_size_per_attention_head,
+        ]
+
+        if SplitAlongDim is not None:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+        else:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        # gather query and key heads across TP ranks if self.layernorm_across_head is True
+        if self.layernorm_across_head and parallel_state.get_tensor_model_parallel_world_size() > 1:
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = tensor_parallel.gather_from_tensor_model_parallel_region(query)
+            key = tensor_parallel.gather_from_tensor_model_parallel_region(key)
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+
+        if self.q_layernorm is not None:
+            if self.layernorm_across_head:                
+                q_flat = query.reshape(query.size(0), query.size(1), -1).contiguous()  # [sq, b, np*hn]
+                q_flat = self.q_layernorm(q_flat.float()) # Wan RMSNorm cast input to float32
+                query = q_flat.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)  # [sq, b, np, hn]
+            else:
+                query = self.q_layernorm(query.contiguous())
+
+        if self.k_layernorm is not None:
+            if self.layernorm_across_head:
+                k_flat = key.reshape(key.size(0), key.size(1), -1).contiguous()
+                k_flat = self.k_layernorm(k_flat.float()) # Wan RMSNorm cast input to float32
+                key = k_flat.view(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
+            else:
+                key = self.k_layernorm(key.contiguous())
+
+        # scatter query and key heads across TP ranks if self.layernorm_across_head is True
+        if self.layernorm_across_head and parallel_state.get_tensor_model_parallel_world_size() > 1:
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = tensor_parallel.scatter_to_tensor_model_parallel_region(query)
+            key = tensor_parallel.scatter_to_tensor_model_parallel_region(key)
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = query.contiguous() # important becuase TE attention expects contiguous tensors
+            key = key.contiguous() # important becuase TE attention expects contiguous tensors
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        return query, key, value
+
+
+class WanCrossAttention(CrossAttention):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: WanCrossAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        cp_comm_type: str = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(
+            config,
+            submodules,
+            layer_number,
+            attn_mask_type,
+            cp_comm_type,
+            pg_collection,
+        )
+
+        self.layernorm_across_head = submodules.layernorm_across_head
+
+        # override q_layernorm
+        if submodules.q_layernorm is not None:
+            if self.layernorm_across_head:
+                q_layernorm_size = self.query_projection_size
+            else:
+                q_layernorm_size = self.hidden_size_per_attention_head
+            import transformer_engine as te
+            norm_config = copy.deepcopy(self.config)
+            norm_config.normalization = "RMSNorm"
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                eps=1e-6,
+                hidden_size=q_layernorm_size,
+                config=norm_config,
+            )
+        else:
+            self.q_layernorm = None
+
+        # override k_layernorm
+        if submodules.k_layernorm is not None:
+            if self.layernorm_across_head:
+                k_layernorm_size = self.kv_projection_size
+            else:
+                k_layernorm_size = self.hidden_size_per_attention_head
+            import transformer_engine as te
+            norm_config = copy.deepcopy(self.config)
+            norm_config.normalization = "RMSNorm"
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                eps=1e-6,
+                hidden_size=k_layernorm_size,
+                config=norm_config,
+            )
+        else:
+            self.k_layernorm = None
+
+    def get_query_key_value_tensors(self, hidden_states, key_value_states):
+        """
+        Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
+        from `key_value_states`.
+        """
+        # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+        mixed_kv, _ = self.linear_kv(key_value_states)
+
+        # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
+        new_tensor_shape = mixed_kv.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            2 * self.hidden_size_per_attention_head,
+        )
+        mixed_kv = mixed_kv.view(*new_tensor_shape)
+
+        # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
+        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+
+        # Attention head [sq, b, h] --> [sq, b, hp]
+        query, _ = self.linear_q(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, np, hn]
+        new_tensor_shape = query.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        query = query.view(*new_tensor_shape)
+
+        # gather query and key heads across TP ranks if self.layernorm_across_head is True
+        if self.layernorm_across_head and parallel_state.get_tensor_model_parallel_world_size() > 1:
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = tensor_parallel.gather_from_tensor_model_parallel_region(query)
+            key = tensor_parallel.gather_from_tensor_model_parallel_region(key)
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+
+        if self.q_layernorm is not None:
+            if self.layernorm_across_head:
+                q_flat = query.reshape(query.size(0), query.size(1), -1).contiguous()  # [sq, b, np*hn]
+                q_flat = self.q_layernorm(q_flat.float()) # Wan RMSNorm cast input to float32
+                query = q_flat.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)  # [sq, b, np, hn]
+            else:
+                query = self.q_layernorm(query.contiguous())
+
+        if self.k_layernorm is not None:
+            if self.layernorm_across_head:
+                k_flat = key.reshape(key.size(0), key.size(1), -1).contiguous()
+                k_flat = self.k_layernorm(k_flat.float()) # Wan RMSNorm cast input to float32
+                key = k_flat.view(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
+            else:
+                key = self.k_layernorm(key.contiguous())
+
+        # scatter query and key heads across TP ranks if self.layernorm_across_head is True
+        if self.layernorm_across_head and parallel_state.get_tensor_model_parallel_world_size() > 1:
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = tensor_parallel.scatter_to_tensor_model_parallel_region(query)
+            key = tensor_parallel.scatter_to_tensor_model_parallel_region(key)
+            query = query.transpose(-2, -1)
+            key = key.transpose(-2, -1)
+            query = query.contiguous() # important becuase TE attention expects contiguous tensors
+            key = key.contiguous() # important becuase TE attention expects contiguous tensors
+
+        return query, key, value
+        
+
+@dataclass
+class WanWithAdaLNSubmodules(TransformerLayerSubmodules):
+    temporal_self_attention: Union[ModuleSpec, type] = IdentityOp
+    full_self_attention: Union[ModuleSpec, type] = IdentityOp
+    norm1: Union[ModuleSpec, type] = None
+    norm3: Union[ModuleSpec, type] = None
+    norm2: Union[ModuleSpec, type] = None
+
+
+class WanAdaLN(MegatronModule):
+    """
+    Adaptive Layer Normalization Module for DiT.
+    """
+
+    def __init__(
+        self, config: TransformerConfig
+    ):
+        super().__init__(config)
+        # modulation
+        self.modulation = nn.Parameter(torch.randn(1, 6, config.hidden_size) / config.hidden_size**0.5)
+
+        setattr(self.modulation, "sequence_parallel", config.sequence_parallel)
+
+    def forward(self, timestep_emb):
+        assert timestep_emb.dtype == torch.float32
+        with amp.autocast(dtype=torch.float32):
+            e = (self.modulation + timestep_emb).chunk(6, dim=1)
+        assert e[0].dtype == torch.float32
+        return e
+
+    # @jit_fuser
+    def modulate(self, x, shift, scale):
+        return x * (1 + scale) + shift
+
+    # @jit_fuser
+    def scale_add(self, residual, x, gate):
+        return residual + gate * x
+
+
+class WanLayerWithAdaLN(TransformerLayer):
+    """A single transformer layer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+
+    DiT with Adapative Layer Normalization.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: float = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ):
+        super().__init__(
+            config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout
+        )
+
+        # # TODO: Override Cross Attention to disable TP Comm overlap as well. ???
+        # # Not disabling will attempt re-use of buffer size same as Q and lead to incorrect tensor shapes.
+        # cp_override_config = copy.deepcopy(config)
+        # cp_override_config.tp_comm_overlap = False
+        # self.cross_attention = build_module(
+        #     submodules.cross_attention,
+        #     config=cp_override_config,
+        #     layer_number=layer_number,
+        # )
+
+        self.full_self_attention = build_module(
+            submodules.full_self_attention,
+            config=self.config,
+            layer_number=layer_number,
+        )
+
+        self.adaLN = WanAdaLN(config=self.config)
+        self.norm1 = build_module(
+            submodules.norm1,
+            dim=config.hidden_size,
+            eps=1e-6,
+            elementwise_affine=False
+        )
+        self.norm3 = build_module(
+            submodules.norm3,
+            dim=config.hidden_size,
+            eps=1e-6,
+            elementwise_affine=True,
+        )
+        self.norm2 = build_module(
+            submodules.norm2,
+            dim=config.hidden_size,
+            eps=1e-6,
+            elementwise_affine=False,
+        )
+
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        attention_bias=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        inference_context=None,
+    ):
+        # the timestep embedding is stored in attention_mask argument
+        timestep_emb = attention_mask
+        rope_emb = rotary_pos_emb
+
+        # DEBUGGING
+        run_debug = False
+
+        # DEBUGGING
+        if run_debug and torch.distributed.get_rank()==0:
+            print("[DEBUG][WanLayerWithAdaLN] ================================")
+            print("[DEBUG][WanLayerWithAdaLN][forward_input] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
+            print("[DEBUG][WanLayerWithAdaLN][forward_input] timestep_emb.shape - timestep_emb.dtype - timestep_emb.mean() - timestep_emb.std() - timestep_emb.norm():", timestep_emb.shape, timestep_emb.dtype, timestep_emb.mean(), timestep_emb.std(), timestep_emb.norm())
+            print("[DEBUG][WanLayerWithAdaLN][forward_input] context.shape - context.dtype - context.mean() - context.std() - context.norm():", context.shape, context.dtype, context.mean(), context.std(), context.norm())
+            if context_mask is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] context_mask.shape - context_mask.dtype - context_mask.mean() - context_mask.std() - context_mask.norm():", context_mask.shape, context_mask.dtype, context_mask.mean(), context_mask.std(), context_mask.norm())
+            if rotary_pos_emb is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_emb.shape - rotary_pos_emb.dtype - rotary_pos_emb.mean() - rotary_pos_emb.std() - rotary_pos_emb.norm():", rotary_pos_emb.shape, rotary_pos_emb.dtype, rotary_pos_emb.mean(), rotary_pos_emb.std(), rotary_pos_emb.norm())
+            if rotary_pos_cos is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_cos.shape - rotary_pos_cos.dtype - rotary_pos_cos.mean() - rotary_pos_cos.std() - rotary_pos_cos.norm():", rotary_pos_cos.shape, rotary_pos_cos.dtype, rotary_pos_cos.mean(), rotary_pos_cos.std(), rotary_pos_cos.norm())
+            if rotary_pos_sin is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_sin.shape - rotary_pos_sin.dtype - rotary_pos_sin.mean() - rotary_pos_sin.std() - rotary_pos_sin.norm():", rotary_pos_sin.shape, rotary_pos_sin.dtype, rotary_pos_sin.mean(), rotary_pos_sin.std(), rotary_pos_sin.norm())
+            if attention_bias is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] attention_bias.shape - attention_bias.dtype - attention_bias.mean() - attention_bias.std() - attention_bias.norm():", attention_bias.shape, attention_bias.dtype, attention_bias.mean(), attention_bias.std(), attention_bias.norm())
+            if inference_params is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] inference_params.shape - inference_params.dtype - inference_params.mean() - inference_params.std() - inference_params.norm():", inference_params.shape, inference_params.dtype, inference_params.mean(), inference_params.std(), inference_params.norm())
+            if packed_seq_params is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] packed_seq_params:", packed_seq_params)
+            if sequence_len_offset is not None:
+                print("[DEBUG][WanLayerWithAdaLN][forward_input] sequence_len_offset.shape - sequence_len_offset.dtype - sequence_len_offset.mean() - sequence_len_offset.std() - sequence_len_offset.norm():", sequence_len_offset.shape, sequence_len_offset.dtype, sequence_len_offset.mean(), sequence_len_offset.std(), sequence_len_offset.norm())
+
+        shift_full, scale_full, gate_full, shift_mlp, scale_mlp, gate_mlp = self.adaLN(timestep_emb)
+        # transpose to bring it to [1, b, ...] format
+        shift_full = shift_full.transpose(0, 1)
+        scale_full = scale_full.transpose(0, 1)
+        gate_full = gate_full.transpose(0, 1)
+        shift_mlp = shift_mlp.transpose(0, 1)
+        scale_mlp = scale_mlp.transpose(0, 1)
+        gate_mlp = gate_mlp.transpose(0, 1)
+
+        # ******************************************** full self attention *******************************************
+
+        if run_debug and torch.distributed.get_rank()==0:
+            print("[DEBUG][WanLayerWithAdaLN] shift_full.shape - shift_full.dtype - shift_full.mean() - shift_full.std():", shift_full.shape, shift_full.dtype, float(shift_full.mean().item()), float(shift_full.std().item()))
+            print("[DEBUG][WanLayerWithAdaLN] scale_full.shape - scale_full.dtype - scale_full.mean() - scale_full.std():", scale_full.shape, scale_full.dtype, scale_full.mean(), scale_full.std())
+            print("[DEBUG][WanLayerWithAdaLN] gate_full.shape - gate_full.dtype - gate_full.mean() - gate_full.std():", gate_full.shape, gate_full.dtype, gate_full.mean(), gate_full.std())
+            print("[DEBUG][WanLayerWithAdaLN] shift_mlp.shape - shift_mlp.dtype - shift_mlp.mean() - shift_mlp.std():", shift_mlp.shape, shift_mlp.dtype, shift_mlp.mean(), shift_mlp.std())
+            print("[DEBUG][WanLayerWithAdaLN] scale_mlp.shape - scale_mlp.dtype - scale_mlp.mean() - scale_mlp.std():", scale_mlp.shape, scale_mlp.dtype, scale_mlp.mean(), scale_mlp.std())
+            print("[DEBUG][WanLayerWithAdaLN] gate_mlp.shape - gate_mlp.dtype - gate_mlp.mean() - gate_mlp.std():", gate_mlp.shape, gate_mlp.dtype, gate_mlp.mean(), gate_mlp.std())
+
+        # DEBUGGING
+        # if run_debug and torch.distributed.get_rank()==0:
+        if run_debug:
+            x_debug = hidden_states # DEBUGGING
+            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std():", hidden_states.shape, hidden_states.dtype, float(hidden_states.mean().item()), float(hidden_states.std().item()))
+            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] self.norm1(hidden_states).shape - self.norm1(hidden_states).dtype - self.norm1(hidden_states).mean() - self.norm1(hidden_states).std():", self.norm1(hidden_states).shape, self.norm1(hidden_states).dtype, float(self.norm1(hidden_states).mean().item()), float(self.norm1(hidden_states).std().item()))
+            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] shift_full.shape - shift_full.dtype - shift_full.mean() - shift_full.std():", shift_full.shape, shift_full.dtype, float(shift_full.mean().item()), float(shift_full.std().item()))
+            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] scale_full.shape - scale_full.dtype - scale_full.mean() - scale_full.std():", scale_full.shape, scale_full.dtype, float(scale_full.mean().item()), float(scale_full.std().item()))
+
+
+        # adaLN with scale + shift + gate
+        pre_full_attn_layernorm_output_ada = self.adaLN.modulate(
+            self.norm1(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            shift=shift_full,
+            scale=scale_full,
+        )
+
+        attention_output, bias = self.full_self_attention(
+            pre_full_attn_layernorm_output_ada,
+            attention_mask=None,
+            rotary_pos_emb=rope_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params['self_attention'],
+        )
+        if bias is not None:
+            attention_output = attention_output + bias
+
+        with amp.autocast(dtype=torch.float32): 
+            hidden_states = self.adaLN.scale_add(residual=hidden_states, x=attention_output, gate=gate_full)
+
+        # DEBUGGING
+        if run_debug and torch.distributed.get_rank()==0:
+            print("[DEBUG][WanLayerWithAdaLN][self_attention] x_debug.shape - x_debug.dtype - x_debug.mean() - x_debug.std() - x.norm:", x_debug.shape, x_debug.dtype, x_debug.mean(), x_debug.std(), x_debug.norm())
+            print("[DEBUG][WanLayerWithAdaLN][self_attention] pre_full_attn_layernorm_output_ada.shape - pre_full_attn_layernorm_output_ada.dtype - pre_full_attn_layernorm_output_ada.mean() - pre_full_attn_layernorm_output_ada.std() - pre_full_attn_layernorm_output_ada.norm:", pre_full_attn_layernorm_output_ada.shape, pre_full_attn_layernorm_output_ada.dtype, pre_full_attn_layernorm_output_ada.mean(), pre_full_attn_layernorm_output_ada.std(), pre_full_attn_layernorm_output_ada.norm())
+            print("[DEBUG][WanLayerWithAdaLN][self_attention] attention_output.shape - attention_output.dtype - attention_output.mean() - attention_output.std() - attention_output.norm():", attention_output.shape, attention_output.dtype, attention_output.mean(), attention_output.std(), attention_output.norm())
+            print("[DEBUG][WanLayerWithAdaLN][self_attention] gate_full.shape - gate_full.dtype - gate_full.mean() - gate_full.std() - gate_full.norm():", gate_full.shape, gate_full.dtype, gate_full.mean(), gate_full.std(), gate_full.norm())
+            print("[DEBUG][WanLayerWithAdaLN][self_attention] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
+
+
+        # ******************************************** cross attention ******************************************************
+
+        attention_output, bias = self.cross_attention(
+            self.norm3(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            attention_mask=context_mask,
+            key_value_states=context,
+            packed_seq_params=packed_seq_params['cross_attention'],
+        )
+        if bias is not None:
+            attention_output = attention_output + bias
+
+        hidden_states = hidden_states + attention_output
+
+        # DEBUGGING
+        if run_debug and torch.distributed.get_rank()==0:
+            print("[DEBUG][WanLayerWithAdaLN][cross_attention] attention_output.shape - attention_output.dtype - attention_output.mean() - attention_output.std() - attention_output.norm():", attention_output.shape, attention_output.dtype, attention_output.mean(), attention_output.std(), attention_output.norm())
+            print("[DEBUG][WanLayerWithAdaLN][cross_attention] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
+
+        # ******************************************** mlp ******************************************************
+
+        pre_mlp_layernorm_output_ada = self.adaLN.modulate(
+            self.norm2(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            shift=shift_mlp,
+            scale=scale_mlp,
+        )
+
+        mlp_output, bias = self.mlp(pre_mlp_layernorm_output_ada)
+        if bias is not None:
+           mlp_output = mlp_output + bias
+
+        # DEBUGGING
+        print("self.mlp.activation_func:", self.mlp.activation_func)
+
+        with amp.autocast(dtype=torch.float32):
+            hidden_states = self.adaLN.scale_add(residual=hidden_states, x=mlp_output, gate=gate_mlp)
+            
+
+        # TODO: Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor. ???
+        output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
+        # output = hidden_states
+
+        # DEBUGGING
+        if run_debug and torch.distributed.get_rank()==0:
+            print("[DEBUG][WanLayerWithAdaLN][mlp] pre_mlp_layernorm_output_ada.shape - pre_mlp_layernorm_output_ada.dtype - pre_mlp_layernorm_output_ada.mean() - pre_mlp_layernorm_output_ada.std() - pre_mlp_layernorm_output_ada.norm():", pre_mlp_layernorm_output_ada.shape, pre_mlp_layernorm_output_ada.dtype, pre_mlp_layernorm_output_ada.mean(), pre_mlp_layernorm_output_ada.std(), pre_mlp_layernorm_output_ada.norm())
+            print("[DEBUG][WanLayerWithAdaLN][mlp] mlp_output.shape - mlp_output.dtype - mlp_output.mean() - mlp_output.std() - mlp_output.norm():", mlp_output.shape, mlp_output.dtype, mlp_output.mean(), mlp_output.std(), mlp_output.norm())
+            print("[DEBUG][WanLayerWithAdaLN][mlp] gate_mlp.shape - gate_mlp.dtype - gate_mlp.mean() - gate_mlp.std() - gate_mlp.norm():", gate_mlp.shape, gate_mlp.dtype, gate_mlp.mean(), gate_mlp.std(), gate_mlp.norm())
+            print("[DEBUG][WanLayerWithAdaLN][mlp] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
+
+        # DEBUGGING
+        if run_debug:
+            hidden_states_concatenated = cat_outputs_cp(hidden_states, 0, parallel_state.get_context_parallel_group())
+            if torch.distributed.get_rank()==0:
+                print("[DEBUG][WanLayerWithAdaLN][mlp] (after cat_outputs_cp) hidden_states_concatenated.shape - hidden_states_concatenated.dtype - hidden_states_concatenated.mean() - hidden_states_concatenated.std() - hidden_states_concatenated.norm():", hidden_states_concatenated.shape, hidden_states_concatenated.dtype, hidden_states_concatenated.mean(), hidden_states_concatenated.std(), hidden_states_concatenated.norm())
+        
+        # # DEBUGGING
+        # if run_debug and torch.distributed.get_rank()==0:
+        #     print(stop_here)
+
+        return output, context
+
+
+import transformer_engine as te
+def get_wan_block_with_transformer_engine_spec() -> ModuleSpec:
+    params = {"attn_mask_type": AttnMaskType.padding}
+    return ModuleSpec(
+        module=WanLayerWithAdaLN,
+        submodules=WanWithAdaLNSubmodules(
+            norm1=WanLayerNorm,
+            norm3=WanLayerNorm,
+            norm2=WanLayerNorm,
+            full_self_attention=ModuleSpec(
+                module=WanSelfAttention,
+                params=params,
+                submodules=WanSelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,     
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,         
+                ),
+            ),
+            cross_attention=ModuleSpec(
+                module=WanCrossAttention,
+                params=params,
+                submodules=WanCrossAttentionSubmodules(
+                    linear_q=TEColumnParallelLinear,
+                    linear_kv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,
+                ),
+            ),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear,
+                    # by default, activation_func is openai_gelu, which is equivalent to nn.GELU(approximate='tanh')
+                    linear_fc2=TERowParallelLinear,
+                ),
+            ),
+        ),
+    )
