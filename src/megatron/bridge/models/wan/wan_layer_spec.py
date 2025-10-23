@@ -128,7 +128,7 @@ class WanSelfAttention(SelfAttention):
             norm_config.normalization = "RMSNorm"
             self.q_layernorm = build_module(
                 submodules.q_layernorm,
-                eps=1e-6,
+                eps=norm_config.layernorm_epsilon,
                 hidden_size=q_layernorm_size,
                 config=norm_config,
             )
@@ -146,7 +146,7 @@ class WanSelfAttention(SelfAttention):
             norm_config.normalization = "RMSNorm"
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
-                eps=1e-6,
+                eps=norm_config.layernorm_epsilon,
                 hidden_size=k_layernorm_size,
                 config=norm_config,
             )
@@ -268,7 +268,7 @@ class WanCrossAttention(CrossAttention):
             norm_config.normalization = "RMSNorm"
             self.q_layernorm = build_module(
                 submodules.q_layernorm,
-                eps=1e-6,
+                eps=norm_config.layernorm_epsilon,
                 hidden_size=q_layernorm_size,
                 config=norm_config,
             )
@@ -286,7 +286,7 @@ class WanCrossAttention(CrossAttention):
             norm_config.normalization = "RMSNorm"
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
-                eps=1e-6,
+                eps=norm_config.layernorm_epsilon,
                 hidden_size=k_layernorm_size,
                 config=norm_config,
             )
@@ -441,19 +441,19 @@ class WanLayerWithAdaLN(TransformerLayer):
         self.norm1 = build_module(
             submodules.norm1,
             dim=config.hidden_size,
-            eps=1e-6,
+            eps=config.layernorm_epsilon,
             elementwise_affine=False
         )
         self.norm3 = build_module(
             submodules.norm3,
             dim=config.hidden_size,
-            eps=1e-6,
+            eps=config.layernorm_epsilon,
             elementwise_affine=True,
         )
         self.norm2 = build_module(
             submodules.norm2,
             dim=config.hidden_size,
-            eps=1e-6,
+            eps=config.layernorm_epsilon,
             elementwise_affine=False,
         )
 
@@ -477,32 +477,6 @@ class WanLayerWithAdaLN(TransformerLayer):
         timestep_emb = attention_mask
         rope_emb = rotary_pos_emb
 
-        # DEBUGGING
-        run_debug = False
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG][WanLayerWithAdaLN] ================================")
-            print("[DEBUG][WanLayerWithAdaLN][forward_input] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
-            print("[DEBUG][WanLayerWithAdaLN][forward_input] timestep_emb.shape - timestep_emb.dtype - timestep_emb.mean() - timestep_emb.std() - timestep_emb.norm():", timestep_emb.shape, timestep_emb.dtype, timestep_emb.mean(), timestep_emb.std(), timestep_emb.norm())
-            print("[DEBUG][WanLayerWithAdaLN][forward_input] context.shape - context.dtype - context.mean() - context.std() - context.norm():", context.shape, context.dtype, context.mean(), context.std(), context.norm())
-            if context_mask is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] context_mask.shape - context_mask.dtype - context_mask.mean() - context_mask.std() - context_mask.norm():", context_mask.shape, context_mask.dtype, context_mask.mean(), context_mask.std(), context_mask.norm())
-            if rotary_pos_emb is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_emb.shape - rotary_pos_emb.dtype - rotary_pos_emb.mean() - rotary_pos_emb.std() - rotary_pos_emb.norm():", rotary_pos_emb.shape, rotary_pos_emb.dtype, rotary_pos_emb.mean(), rotary_pos_emb.std(), rotary_pos_emb.norm())
-            if rotary_pos_cos is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_cos.shape - rotary_pos_cos.dtype - rotary_pos_cos.mean() - rotary_pos_cos.std() - rotary_pos_cos.norm():", rotary_pos_cos.shape, rotary_pos_cos.dtype, rotary_pos_cos.mean(), rotary_pos_cos.std(), rotary_pos_cos.norm())
-            if rotary_pos_sin is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] rotary_pos_sin.shape - rotary_pos_sin.dtype - rotary_pos_sin.mean() - rotary_pos_sin.std() - rotary_pos_sin.norm():", rotary_pos_sin.shape, rotary_pos_sin.dtype, rotary_pos_sin.mean(), rotary_pos_sin.std(), rotary_pos_sin.norm())
-            if attention_bias is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] attention_bias.shape - attention_bias.dtype - attention_bias.mean() - attention_bias.std() - attention_bias.norm():", attention_bias.shape, attention_bias.dtype, attention_bias.mean(), attention_bias.std(), attention_bias.norm())
-            if inference_params is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] inference_params.shape - inference_params.dtype - inference_params.mean() - inference_params.std() - inference_params.norm():", inference_params.shape, inference_params.dtype, inference_params.mean(), inference_params.std(), inference_params.norm())
-            if packed_seq_params is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] packed_seq_params:", packed_seq_params)
-            if sequence_len_offset is not None:
-                print("[DEBUG][WanLayerWithAdaLN][forward_input] sequence_len_offset.shape - sequence_len_offset.dtype - sequence_len_offset.mean() - sequence_len_offset.std() - sequence_len_offset.norm():", sequence_len_offset.shape, sequence_len_offset.dtype, sequence_len_offset.mean(), sequence_len_offset.std(), sequence_len_offset.norm())
-
         shift_full, scale_full, gate_full, shift_mlp, scale_mlp, gate_mlp = self.adaLN(timestep_emb)
         # transpose to bring it to [1, b, ...] format
         shift_full = shift_full.transpose(0, 1)
@@ -513,24 +487,6 @@ class WanLayerWithAdaLN(TransformerLayer):
         gate_mlp = gate_mlp.transpose(0, 1)
 
         # ******************************************** full self attention *******************************************
-
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG][WanLayerWithAdaLN] shift_full.shape - shift_full.dtype - shift_full.mean() - shift_full.std():", shift_full.shape, shift_full.dtype, float(shift_full.mean().item()), float(shift_full.std().item()))
-            print("[DEBUG][WanLayerWithAdaLN] scale_full.shape - scale_full.dtype - scale_full.mean() - scale_full.std():", scale_full.shape, scale_full.dtype, scale_full.mean(), scale_full.std())
-            print("[DEBUG][WanLayerWithAdaLN] gate_full.shape - gate_full.dtype - gate_full.mean() - gate_full.std():", gate_full.shape, gate_full.dtype, gate_full.mean(), gate_full.std())
-            print("[DEBUG][WanLayerWithAdaLN] shift_mlp.shape - shift_mlp.dtype - shift_mlp.mean() - shift_mlp.std():", shift_mlp.shape, shift_mlp.dtype, shift_mlp.mean(), shift_mlp.std())
-            print("[DEBUG][WanLayerWithAdaLN] scale_mlp.shape - scale_mlp.dtype - scale_mlp.mean() - scale_mlp.std():", scale_mlp.shape, scale_mlp.dtype, scale_mlp.mean(), scale_mlp.std())
-            print("[DEBUG][WanLayerWithAdaLN] gate_mlp.shape - gate_mlp.dtype - gate_mlp.mean() - gate_mlp.std():", gate_mlp.shape, gate_mlp.dtype, gate_mlp.mean(), gate_mlp.std())
-
-        # DEBUGGING
-        # if run_debug and torch.distributed.get_rank()==0:
-        if run_debug:
-            x_debug = hidden_states # DEBUGGING
-            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std():", hidden_states.shape, hidden_states.dtype, float(hidden_states.mean().item()), float(hidden_states.std().item()))
-            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] self.norm1(hidden_states).shape - self.norm1(hidden_states).dtype - self.norm1(hidden_states).mean() - self.norm1(hidden_states).std():", self.norm1(hidden_states).shape, self.norm1(hidden_states).dtype, float(self.norm1(hidden_states).mean().item()), float(self.norm1(hidden_states).std().item()))
-            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] shift_full.shape - shift_full.dtype - shift_full.mean() - shift_full.std():", shift_full.shape, shift_full.dtype, float(shift_full.mean().item()), float(shift_full.std().item()))
-            print(f"[DEBUG][WanLayerWithAdaLN] [rank {torch.distributed.get_rank()}] scale_full.shape - scale_full.dtype - scale_full.mean() - scale_full.std():", scale_full.shape, scale_full.dtype, float(scale_full.mean().item()), float(scale_full.std().item()))
-
 
         # adaLN with scale + shift + gate
         pre_full_attn_layernorm_output_ada = self.adaLN.modulate(
@@ -553,15 +509,6 @@ class WanLayerWithAdaLN(TransformerLayer):
         with amp.autocast(dtype=torch.float32): 
             hidden_states = self.adaLN.scale_add(residual=hidden_states, x=attention_output, gate=gate_full)
 
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG][WanLayerWithAdaLN][self_attention] x_debug.shape - x_debug.dtype - x_debug.mean() - x_debug.std() - x.norm:", x_debug.shape, x_debug.dtype, x_debug.mean(), x_debug.std(), x_debug.norm())
-            print("[DEBUG][WanLayerWithAdaLN][self_attention] pre_full_attn_layernorm_output_ada.shape - pre_full_attn_layernorm_output_ada.dtype - pre_full_attn_layernorm_output_ada.mean() - pre_full_attn_layernorm_output_ada.std() - pre_full_attn_layernorm_output_ada.norm:", pre_full_attn_layernorm_output_ada.shape, pre_full_attn_layernorm_output_ada.dtype, pre_full_attn_layernorm_output_ada.mean(), pre_full_attn_layernorm_output_ada.std(), pre_full_attn_layernorm_output_ada.norm())
-            print("[DEBUG][WanLayerWithAdaLN][self_attention] attention_output.shape - attention_output.dtype - attention_output.mean() - attention_output.std() - attention_output.norm():", attention_output.shape, attention_output.dtype, attention_output.mean(), attention_output.std(), attention_output.norm())
-            print("[DEBUG][WanLayerWithAdaLN][self_attention] gate_full.shape - gate_full.dtype - gate_full.mean() - gate_full.std() - gate_full.norm():", gate_full.shape, gate_full.dtype, gate_full.mean(), gate_full.std(), gate_full.norm())
-            print("[DEBUG][WanLayerWithAdaLN][self_attention] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
-
-
         # ******************************************** cross attention ******************************************************
 
         attention_output, bias = self.cross_attention(
@@ -575,11 +522,6 @@ class WanLayerWithAdaLN(TransformerLayer):
 
         hidden_states = hidden_states + attention_output
 
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG][WanLayerWithAdaLN][cross_attention] attention_output.shape - attention_output.dtype - attention_output.mean() - attention_output.std() - attention_output.norm():", attention_output.shape, attention_output.dtype, attention_output.mean(), attention_output.std(), attention_output.norm())
-            print("[DEBUG][WanLayerWithAdaLN][cross_attention] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
-
         # ******************************************** mlp ******************************************************
 
         pre_mlp_layernorm_output_ada = self.adaLN.modulate(
@@ -591,9 +533,6 @@ class WanLayerWithAdaLN(TransformerLayer):
         mlp_output, bias = self.mlp(pre_mlp_layernorm_output_ada)
         if bias is not None:
            mlp_output = mlp_output + bias
-
-        # DEBUGGING
-        print("self.mlp.activation_func:", self.mlp.activation_func)
 
         with amp.autocast(dtype=torch.float32):
             hidden_states = self.adaLN.scale_add(residual=hidden_states, x=mlp_output, gate=gate_mlp)
@@ -607,23 +546,6 @@ class WanLayerWithAdaLN(TransformerLayer):
         # 'view' tensor. ???
         output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
         # output = hidden_states
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG][WanLayerWithAdaLN][mlp] pre_mlp_layernorm_output_ada.shape - pre_mlp_layernorm_output_ada.dtype - pre_mlp_layernorm_output_ada.mean() - pre_mlp_layernorm_output_ada.std() - pre_mlp_layernorm_output_ada.norm():", pre_mlp_layernorm_output_ada.shape, pre_mlp_layernorm_output_ada.dtype, pre_mlp_layernorm_output_ada.mean(), pre_mlp_layernorm_output_ada.std(), pre_mlp_layernorm_output_ada.norm())
-            print("[DEBUG][WanLayerWithAdaLN][mlp] mlp_output.shape - mlp_output.dtype - mlp_output.mean() - mlp_output.std() - mlp_output.norm():", mlp_output.shape, mlp_output.dtype, mlp_output.mean(), mlp_output.std(), mlp_output.norm())
-            print("[DEBUG][WanLayerWithAdaLN][mlp] gate_mlp.shape - gate_mlp.dtype - gate_mlp.mean() - gate_mlp.std() - gate_mlp.norm():", gate_mlp.shape, gate_mlp.dtype, gate_mlp.mean(), gate_mlp.std(), gate_mlp.norm())
-            print("[DEBUG][WanLayerWithAdaLN][mlp] hidden_states.shape - hidden_states.dtype - hidden_states.mean() - hidden_states.std() - hidden_states.norm():", hidden_states.shape, hidden_states.dtype, hidden_states.mean(), hidden_states.std(), hidden_states.norm())
-
-        # DEBUGGING
-        if run_debug:
-            hidden_states_concatenated = cat_outputs_cp(hidden_states, 0, parallel_state.get_context_parallel_group())
-            if torch.distributed.get_rank()==0:
-                print("[DEBUG][WanLayerWithAdaLN][mlp] (after cat_outputs_cp) hidden_states_concatenated.shape - hidden_states_concatenated.dtype - hidden_states_concatenated.mean() - hidden_states_concatenated.std() - hidden_states_concatenated.norm():", hidden_states_concatenated.shape, hidden_states_concatenated.dtype, hidden_states_concatenated.mean(), hidden_states_concatenated.std(), hidden_states_concatenated.norm())
-        
-        # # DEBUGGING
-        # if run_debug and torch.distributed.get_rank()==0:
-        #     print(stop_here)
 
         return output, context
 

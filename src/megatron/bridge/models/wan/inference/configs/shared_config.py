@@ -11,9 +11,7 @@ wan_shared_cfg.t5_dtype = torch.bfloat16
 wan_shared_cfg.text_len = 512
 
 # transformer
-# DEBUGGING
 wan_shared_cfg.param_dtype = torch.bfloat16
-# wan_shared_cfg.param_dtype = torch.float32
 
 # inference
 wan_shared_cfg.num_train_timesteps = 1000

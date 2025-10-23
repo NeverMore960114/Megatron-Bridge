@@ -24,8 +24,7 @@ from megatron.bridge.models.wan.inference.utils.fm_solvers import (
     retrieve_timesteps,
 )
 from megatron.bridge.models.wan.inference.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core import dist_checkpointing, parallel_state
+from megatron.core import parallel_state
 from torch.nn import functional as F
 
 import math
@@ -90,6 +89,7 @@ class FlowInferencePipeline:
         wan_checkpoint_dir = os.path.join(checkpoint_dir, "iter_0000000")
         self.model = self.setup_model_from_checkpoint(wan_checkpoint_dir)
 
+        # set self.sp_size=1 for later use, just to respect the original Wan inference code
         self.sp_size = 1
 
         if dist.is_initialized():
@@ -101,15 +101,15 @@ class FlowInferencePipeline:
 
     def patchify(self, x, patch_size):
         """
-        Convert a list of reconstructed video tensor into patch embeddings (inverse of `unpatchify`).
+        Convert a list of reconstructed video tensor into patch embeddings.
+        This method is the inverse of `unpatchify`.
 
         Args:
-            x (list[torch.Tensor]): list of tensors, each with shape [C, F * pF, H * pH, W * pW]
+            x (list[torch.Tensor]): list of tensors, each with shape [c, F_patches * pF, H_patches * pH, W_patches * pW]
             patch_size (tuple): (pF, pH, pW)
 
         Returns:
-            torch.Tensor: shape [num_patches, C * prod(patch_size)],
-                        where num_patches = F * H * W
+            torch.Tensor: shape [ (F_patches * H_patches * W_patches), (c * pF * pH * pW)],
         """
         out = []
         for u in x:
@@ -118,38 +118,33 @@ class FlowInferencePipeline:
             assert F_pF % pF == 0 and H_pH % pH == 0 and W_pW % pW == 0, \
                 "Spatial dimensions must be divisible by patch size."
 
-            F, H, W = F_pF // pF, H_pH // pH, W_pW // pW
+            F_patches, H_patches, W_patches = F_pF // pF, H_pH // pH, W_pW // pW
 
             # split spatial dims into (grid, patch) and reorder to match original patch layout:
-            # start: (C, F_pF, H_pW, W_pW)
-            # reshape -> (C, F, pF, H, pH, W, pW)
-            # permute -> (F, H, W, pF, pH, pW, C)
-            # DEBUGGING
-            t = u.reshape(c, F, pF, H, pH, W, pW)
-            # t = u.reshape(c, F, pF, W, pW, H, pH)
+            # start: (c, F_patches * pF, H_patches * pH, W_patches * pW)
+            # reshape -> (c, F_patches, pF, H_patches, pH, W_patches, pW)
+            # permute -> (F_patches, H_patches, W_patches, pF, pH, pW, c)
+            t = u.reshape(c, F_patches, pF, H_patches, pH, W_patches, pW)
             t = t.permute(1, 3, 5, 0, 2, 4, 6)
 
-            num_patches = F * H * W
+            num_patches = F_patches * H_patches * W_patches
             out.append(t.reshape(num_patches, c * (pF * pH * pW)))
         return out
         
 
-    def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor, out_dim: int) -> torch.Tensor:
+    def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor, out_dim: int) -> list[torch.Tensor]:
         r"""
-        Reconstruct video tensors from patch embeddings.
+        Reconstruct video tensors from patch embeddings into a list of videotensors.
 
         Args:
-            x (Tensor):
-                Tensor of patchified features, with shape [L, C_out * prod(patch_size)]
+            x (torch.Tensor):
+                Tensor of patchified features, with shape [seq_len, c * pF * pH * pW]
             grid_sizes (Tensor):
                 Original spatial-temporal grid dimensions before patching,
                     shape [B, 3] (3 dimensions correspond to F_patches, H_patches, W_patches)
 
         Returns:
-            Tensor:
-                # Reconstructed video tensor with shape [C_out, F, H / 8, W / 8]
-                # ??? list of tensors, because each sample in the batch has a different video shape, the original video shape is determined by the grid_sizes.
-                list[Tensor]: list of tensors, each with shape [C_out, F, H / 8, W / 8]
+            list[torch.Tensor]: list of tensors, each with shape [c, F_latents, H_latents, W_latents]
         """
 
         c = out_dim
@@ -159,34 +154,21 @@ class FlowInferencePipeline:
             u = torch.einsum('fhwpqrc->cfphqwr', u)
             u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
             out.append(u)
-        # because the video shapes are different for each sample in the batch, we cannot stack the videos into a single tensor.
-        # out = torch.stack(out, dim=0)
         return out
 
 
     def setup_model_from_checkpoint(self, checkpoint_dir):
-
-        # def init_distributed(tp_size: int = 1, pp_size: int = 1, cp_size: int = 1):
-        #     rank = int(os.environ.get("LOCAL_RANK", 0))
-        #     world_size = int(os.environ.get("WORLD_SIZE", 1))
-        #     torch.cuda.set_device(rank % torch.cuda.device_count())
-        #     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
-        #     parallel_state.initialize_model_parallel(tp_size, pp_size, context_parallel_size=cp_size)
-        # init_distributed(self.tensor_parallel_size, self.pipeline_parallel_size, self.context_parallel_size)
-
         provider = WanModelProvider()
         provider.tensor_model_parallel_size = self.tensor_parallel_size
         provider.pipeline_model_parallel_size = self.pipeline_parallel_size
         provider.context_parallel_size = self.context_parallel_size
         provider.sequence_parallel = self.sequence_parallel
-        print(f"provider.sequence_parallel: {provider.sequence_parallel}")
         provider.pipeline_dtype = self.pipeline_dtype
         # Once all overrides are set, finalize the model provider to ensure the post initialization logic is run
         provider.finalize()
         provider.initialize_model_parallel(seed=0)
         
-
-        ## Method 1: Read from megatron checkpoint
+        ## Read from megatron checkpoint
         from megatron.bridge.training.model_load_save import load_megatron_model as _load_megatron_model
         model = _load_megatron_model(
             checkpoint_dir,
@@ -200,17 +182,13 @@ class FlowInferencePipeline:
         )
         if isinstance(model, list):
             model = model[0]
-        # ## Method 2: Read from megatron checkpoint
-        # model = provider.provide_distributed_model(wrap_with_ddp=False)
-        ## Method 3 (not loading checkpoint)
-        # model = provider.provide()
 
         return model
 
 
     def grid_sizes_calculation(
         self,
-        input_shape: Tuple[int, int, int],  # (D_in, H_in, W_in)
+        input_shape: Tuple[int, int, int],  # (F_latents, H_latents, W_latents)
         kernel_size: Union[int, Tuple[int, int, int]],
         stride: Union[int, Tuple[int, int, int]] = 1,
         padding: Union[int, Tuple[int, int, int]] = 0,
@@ -220,11 +198,11 @@ class FlowInferencePipeline:
         Compute the (f,h,w) output spatial/temporal dimensions of a Conv3d patch embedder.
 
         Args:
-            input_shape: (D_in, H_in, W_in)
+            input_shape: (F_latents, H_latents, W_latents)
             kernel_size, stride, padding, dilation of the Conv3d patch embedder: either int or 3-tuple
 
         Returns:
-            (D_out, H_out, W_out)
+            (F_patches, H_patches, W_patches)
         """
         
         def to_tuple(x):
@@ -255,9 +233,8 @@ class FlowInferencePipeline:
         timestep: torch.Tensor,
         arg_c: dict,        
     ) -> torch.Tensor:
-        """One decode step supporting pipeline parallelism for batch_size=1.
-
-        Returns a tensor containing the noise prediction.
+        """
+        Forward pass supporting pipeline parallelism.
         """
 
         from megatron.core import parallel_state
@@ -267,7 +244,7 @@ class FlowInferencePipeline:
         is_pp_first = parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         is_pp_last = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
 
-        # TP-only or single-rank
+        # PP=1: no pipeline parallelism
         if pp_world_size == 1:
             noise_pred_pp = self.model(
                 latent_model_input,
@@ -276,17 +253,11 @@ class FlowInferencePipeline:
                 **arg_c)
             return noise_pred_pp
 
-        # Pipeline-parallel path
+        # PP>1: pipeline parallelism
         hidden_size = self.model.config.hidden_size
         batch_size = latent_model_input.shape[1]
+        # noise prediction shape for communication between first and last pipeline stages
         noise_pred_pp_shape = list(latent_model_input.shape)
-        print(f"batch_size: {batch_size}")
-
-        # DEBUGGING
-        # we should bring x unpatchify out of the model
-        # x_after_patch_embedding_shape = [16, 3, 104, 60]   # ????
-        # when bring unpatchified out, for pp communicate last stage to first stage, this should be
-        # x_after_patch_embedding_shape = [max_video_seq_len, batch_size, (ph pw pt C)]
 
         if is_pp_first:
             # First stage: compute multimodal + first PP slice, send activations, then receive sampled token
@@ -295,10 +266,7 @@ class FlowInferencePipeline:
                 grid_sizes=grid_sizes,
                 t=timestep,
                 **arg_c)
-            print(f"[rank {torch.distributed.get_rank()}] Got here! - self.model")
             send_to_next_pipeline_rank(hidden_states)
-            print(f"[rank {torch.distributed.get_rank()}] Got here! - hidden_states.shape: {hidden_states.shape} - hidden_states.dtype: {hidden_states.dtype}")
-            print(f"[rank {torch.distributed.get_rank()}] Got here! - send_to_next_pipeline_rank")
 
             noise_pred_pp = broadcast_from_last_pipeline_stage(noise_pred_pp_shape, dtype=torch.float32)
             return noise_pred_pp
@@ -311,7 +279,6 @@ class FlowInferencePipeline:
                 device=latent_model_input[0].device,
             )
             recv_from_prev_pipeline_rank_(recv_buffer)
-            # DEBUGGING
             recv_buffer = recv_buffer.to(torch.bfloat16) # ????
             self.model.set_input_tensor(recv_buffer)
             noise_pred_pp = self.model(
@@ -319,9 +286,6 @@ class FlowInferencePipeline:
                 grid_sizes=grid_sizes,
                 t=timestep,
                 **arg_c)
-
-            
-            print("noise_pred_pp_shape: ", noise_pred_pp_shape)
 
             noise_pred_pp = broadcast_from_last_pipeline_stage(noise_pred_pp_shape, dtype=noise_pred_pp.dtype, tensor=noise_pred_pp.contiguous())
             return noise_pred_pp
@@ -332,13 +296,9 @@ class FlowInferencePipeline:
             dtype=next(self.model.parameters()).dtype,
             device=latent_model_input[0].device,
         )
-        print(f"[rank {torch.distributed.get_rank()}] Got here! - recv_buffer.shape: {recv_buffer.shape} - recv_buffer.dtype: {recv_buffer.dtype}")
         recv_from_prev_pipeline_rank_(recv_buffer)
-        print(f"[rank {torch.distributed.get_rank()}] Got here! - recv_from_prev_pipeline_rank_")
-        # DEBUGGING
         recv_buffer = recv_buffer.to(torch.bfloat16) # ????
         self.model.set_input_tensor(recv_buffer)
-        print(f"[rank {torch.distributed.get_rank()}] Got here! - self.model.set_input_tensor")
         hidden_states = self.model(
             latent_model_input,
             grid_sizes=grid_sizes,
@@ -365,11 +325,11 @@ class FlowInferencePipeline:
         Generates video frames from text prompt using diffusion process.
 
         Args:
-            input_prompt (`str`):
+            prompts (`list[str]`):
                 Text prompt for content generation
-            size (tupele[`int`], *optional*, defaults to (1280,720)):
+            sizes (list[tuple[int, int]]):
                 Controls video resolution, (width,height).
-            frame_num (`int`, *optional*, defaults to 81):
+            frame_nums (`list[int]`):
                 How many frames to sample from a video. The number should be 4n+1
             shift (`float`, *optional*, defaults to 5.0):
                 Noise schedule shift parameter. Affects temporal dynamics
@@ -395,13 +355,6 @@ class FlowInferencePipeline:
                 - W: Frame width from size)
         """
     
-        # DEBUGGING
-        run_debug = True
-
-        # size = sizes[0]
-        # input_prompt = prompts[0]
-        # frame_num = frame_nums[0]
-        
         # preprocess
         target_shapes = []
         for size, frame_num in zip(sizes, frame_nums):
@@ -423,6 +376,7 @@ class FlowInferencePipeline:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+
 
         ## process context
         context_max_len = 512
@@ -449,7 +403,6 @@ class FlowInferencePipeline:
         contexts_null = torch.stack(contexts_null, dim=1)
 
 
-
         ## setup noise
         noises = []
         for target_shape in target_shapes:
@@ -464,9 +417,6 @@ class FlowInferencePipeline:
                     generator=seed_g)
             )
 
-        # DEBUGGING
-        print("[DEBUG] noises[0].shape - noises[0].dtype - noises[0].mean() - noises[0].std() - noises[0].norm():", noises[0].shape, noises[0].dtype, noises[0].mean(), noises[0].std(), noises[0].norm())
-        print("[DEBUG] noises[0]:", noises[0])
 
         # calculate grid_sizes
         grid_sizes = [self.grid_sizes_calculation(
@@ -550,7 +500,6 @@ class FlowInferencePipeline:
                 batch_size = len(latents)
 
                 # patchify latents
-                # ??? when batch_size > 1, we need to pad to have same length
                 unpatchified_latents = latents
                 latents = self.patchify(latents, self.patch_size)
                 # pad to have same length
@@ -563,15 +512,6 @@ class FlowInferencePipeline:
                 timestep = [t] * batch_size
                 timestep = torch.stack(timestep)
 
-                # DEBUGGING
-                if run_debug and torch.distributed.get_rank()==0:
-                    print(f"[DEBUG] [rank {torch.distributed.get_rank()}] contexts.shape: {contexts.shape}")
-                    print(f"[DEBUG] [rank {torch.distributed.get_rank()}] max_video_seq_len: {max_video_seq_len}")
-                    print(f"[DEBUG] [rank {torch.distributed.get_rank()}] grid_sizes: {grid_sizes}")
-                    print(f"[DEBUG] [rank {torch.distributed.get_rank()}] latent_model_input.shape: {latent_model_input.shape}")
-                    print(f"[DEBUG] [rank {torch.distributed.get_rank()}] timestep.shape: {timestep.shape}")
-
-
                 self.model.to(self.device)
                 noise_pred_cond = self.forward_pp_step(
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, arg_c=arg_c)
@@ -580,25 +520,15 @@ class FlowInferencePipeline:
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, arg_c=arg_null)
 
 
-                # noise_pred = noise_pred_uncond + guide_scale * (
-                #     noise_pred_cond - noise_pred_uncond)
-
-                # DEBUGGING
+                # run unpatchify
                 unpatchified_noise_pred_cond = noise_pred_cond
                 unpatchified_noise_pred_cond = unpatchified_noise_pred_cond.transpose(0, 1) # bring sbhd -> bshd
-                # when unpatchifying, the code will truncate the padded videos into the original video shape, based on the grid_sizes. ???
+                # when unpatchifying, the code will truncate the padded videos into the original video shape, based on the grid_sizes.
                 unpatchified_noise_pred_cond = self.unpatchify(unpatchified_noise_pred_cond, grid_sizes, self.vae.model.z_dim)
-
                 unpatchified_noise_pred_uncond = noise_pred_uncond
                 unpatchified_noise_pred_uncond = unpatchified_noise_pred_uncond.transpose(0, 1) # bring sbhd -> bshd
-                # when unpatchifying, the code will truncate the padded videos into the original video shape, based on the grid_sizes. ???
+                # when unpatchifying, the code will truncate the padded videos into the original video shape, based on the grid_sizes.
                 unpatchified_noise_pred_uncond = self.unpatchify(unpatchified_noise_pred_uncond, grid_sizes, self.vae.model.z_dim)
-
-                # DEBUGGING
-                if run_debug and torch.distributed.get_rank()==0:
-                    print(f"[DEBUG] unpatchified_noise_pred_cond[0].shape - unpatchified_noise_pred_cond[0].dtype - unpatchified_noise_pred_cond[0].mean() - unpatchified_noise_pred_cond[0].std() - unpatchified_noise_pred_cond[0].norm(): {unpatchified_noise_pred_cond[0].shape} - {unpatchified_noise_pred_cond[0].dtype} - {unpatchified_noise_pred_cond[0].mean()} - {unpatchified_noise_pred_cond[0].std()} - {unpatchified_noise_pred_cond[0].norm()}")
-                    print(f"[DEBUG] unpatchified_noise_pred_uncond[0].shape - unpatchified_noise_pred_uncond[0].dtype - unpatchified_noise_pred_uncond[0].mean() - unpatchified_noise_pred_uncond[0].std() - unpatchified_noise_pred_uncond[0].norm(): {unpatchified_noise_pred_uncond[0].shape} - {unpatchified_noise_pred_uncond[0].dtype} - {unpatchified_noise_pred_uncond[0].mean()} - {unpatchified_noise_pred_uncond[0].std()} - {unpatchified_noise_pred_uncond[0].norm()}")
-
 
                 noise_preds = []
                 for i in range(batch_size):
@@ -606,71 +536,9 @@ class FlowInferencePipeline:
                         unpatchified_noise_pred_cond[i] - unpatchified_noise_pred_uncond[i])
                     noise_preds.append(noise_pred)
 
-                    # unpatchified_noise_pred_uncond = unpatchified_noise_pred_uncond[0]
-                    # unpatchified_noise_pred_cond = unpatchified_noise_pred_cond[0]
-
-                    # noise_pred = unpatchified_noise_pred_uncond + guide_scale * (
-                    #     unpatchified_noise_pred_cond - unpatchified_noise_pred_uncond)
-
-                # # DEBUGGING
-                # # we will be running unpatchify here???
-                # # x0 = latents
-                # if run_debug and torch.distributed.get_rank()==0:
-                #     print(f"[DEBUG] [rank {torch.distributed.get_rank()}] (before unpatchify) noise_pred_cond.shape: {noise_pred_cond.shape}")
-                #     print(f"[DEBUG] [rank {torch.distributed.get_rank()}] (before unpatchify) noise_pred_uncond.shape: {noise_pred_uncond.shape}")
-                # noise_pred_cond = noise_pred_cond.transpose(0, 1)
-                # noise_pred_cond = self.unpatchify(noise_pred_cond, grid_sizes, self.vae.model.z_dim)
-                # noise_pred_cond = noise_pred_cond.transpose(0, 1)
-                # noise_pred_uncond = noise_pred_uncond.transpose(0, 1)
-                # noise_pred_uncond = self.unpatchify(noise_pred_uncond, grid_sizes, self.vae.model.z_dim)
-                # noise_pred_uncond = noise_pred_uncond.transpose(0, 1)
-                # if run_debug and torch.distributed.get_rank()==0:
-                #     print(f"[DEBUG] [rank {torch.distributed.get_rank()}] (after unpatchify) noise_pred_cond.shape: {noise_pred_cond.shape}")
-                #     print(f"[DEBUG] [rank {torch.distributed.get_rank()}] (after unpatchify) noise_pred_uncond.shape: {noise_pred_uncond.shape}")
-                #     print(stop_here)
-
-                # # we run unpatchify here, but unpatchify should be run seprately for each sample in the batch, because the video shape is different for each sample in the batch.
-                # # ??? when batch_size > 1, we need to run sample_scheduler.step seprately for each sample in the batch.
-                # noise_pred = noise_pred.transpose(0, 1) # bring sbhd -> bshd
-                # noise_pred = self.unpatchify(noise_pred, grid_sizes, self.vae.model.z_dim)
-
-                # print("[DEBUG] len(noise_pred): ", len(noise_pred))
-                # print("[DEBUG] len(unpatchified_latents): ", len(unpatchified_latents))
-                # print("[DEBUG] noise_pred[0].shape - noise_pred[0].dtype - noise_pred[0].mean() - noise_pred[0].std() - noise_pred[0].norm(): ", noise_pred[0].shape, noise_pred[0].dtype, noise_pred[0].mean(), noise_pred[0].std(), noise_pred[0].norm())
-                # print("[DEBUG] unpatchified_latents[0].shape - unpatchified_latents[0].dtype - unpatchified_latents[0].mean() - unpatchified_latents[0].std() - unpatchified_latents[0].norm(): ", unpatchified_latents[0].shape, unpatchified_latents[0].dtype, unpatchified_latents[0].mean(), unpatchified_latents[0].std(), unpatchified_latents[0].norm())
-
-                # latents = []
-                # for i in range(len(noise_pred)):
-                #     temp_x0 = sample_scheduler.step(
-                #         noise_pred[i].unsqueeze(0),
-                #         t,
-                #         unpatchified_latents[i].unsqueeze(0),
-                #         return_dict=False,
-                #         generator=seed_g)[0]
-                #     latents.append(temp_x0.squeeze(0))
-
-                # print("len(latents): ", len(latents))
-                # print("latents[0].shape: ", latents[0].shape)
-
-                # latents = unpatchified_latents
-                # print(f"[DEBUG] noise_pred.shape - noise_pred.dtype - noise_pred.mean() - noise_pred.std() - noise_pred.norm(): {noise_pred.shape} - {noise_pred.dtype} - {noise_pred.mean()} - {noise_pred.std()} - {noise_pred.norm()}")
-                # print(f"[DEBUG] latents[0].shape - latents[0].dtype - latents[0].mean() - latents[0].std() - latents[0].norm(): {latents[0].shape} - {latents[0].dtype} - {latents[0].mean()} - {latents[0].std()} - {latents[0].norm()}")
-                # print(f"[DEBUG] noise_pred: {noise_pred}")
-                # print(f"[DEBUG] latents[0]: {latents[0]}")
-
-                print("batch_size: ", batch_size)
-
                 # step and update latents
                 latents = []
                 for i in range(batch_size):
-
-                    # DEBUGGING
-                    if run_debug and torch.distributed.get_rank()==0:
-                        print("[DEBUG] len(unpatchified_latents): ", len(unpatchified_latents))
-                        print("[DEBUG] len(noise_preds): ", len(noise_preds))
-                        print("[DEBUG] unpatchified_latents[i].shape - unpatchified_latents[i].dtype - unpatchified_latents[i].mean() - unpatchified_latents[i].std() - unpatchified_latents[i].norm(): ", unpatchified_latents[i].shape, unpatchified_latents[i].dtype, unpatchified_latents[i].mean(), unpatchified_latents[i].std(), unpatchified_latents[i].norm())
-                        print("[DEBUG] noise_preds[i].shape - noise_preds[i].dtype - noise_preds[i].mean() - noise_preds[i].std() - noise_preds[i].norm(): ", noise_preds[i].shape, noise_preds[i].dtype, noise_preds[i].mean(), noise_preds[i].std(), noise_preds[i].norm())
-
 
                     if sample_solver == 'unipc':
                         temp_x0 = schedulers[i].step(
@@ -688,25 +556,6 @@ class FlowInferencePipeline:
                             generator=seed_g)[0]
                     latents.append(temp_x0.squeeze(0))
 
-            # # DEBUGGING
-            # # we will be running unpatchify here???
-            # # x0 = latents
-            # x0 = self.unpatchify(latents, grid_sizes)
-
-            # # loop through each sample in the batch
-            # videos = []
-            # if offload_model:
-            #     self.model.cpu()
-            #     torch.cuda.empty_cache()
-            # x0 = latents
-            # if self.rank == 0:
-            #     videos = self.vae.decode(x0)
-
-            # DEBUGGING
-            print("[DEBUG] len(latents): ", len(latents))
-            print("[DEBUG] latents[0].shape - latents[0].dtype - latents[0].mean() - latents[0].std() - latents[0].norm(): ", latents[0].shape, latents[0].dtype, latents[0].mean(), latents[0].std(), latents[0].norm())
-            print("[DEBUG] latents[0]: ", latents[0])
-
             x0 = latents
             if offload_model:
                 self.model.cpu()
@@ -715,17 +564,6 @@ class FlowInferencePipeline:
                 videos = self.vae.decode(x0)
             else:
                 videos = None
-
-
-            # # DEBUGGING
-            # print("len(latents): ", len(latents))
-            # print("latents[0].shape - latents[0].dtype - latents[0].mean() - latents[0].std() - latents[0].norm(): ", latents[0].shape, latents[0].dtype, latents[0].mean(), latents[0].std(), latents[0].norm())
-            # print("latents[0]: ", latents[0])
-            # print("len(videos): ", len(videos))
-            if videos is not None:
-                print("len(videos): ", len(videos))
-                print("[DEBUG] videos[0].shape - videos[0].dtype - videos[0].mean() - videos[0].std() - videos[0].norm(): ", videos[0].shape, videos[0].dtype, videos[0].mean(), videos[0].std(), videos[0].norm())
-                print("[DEBUG] videos[0]: ", videos[0])
 
         del noises, latents
         if sample_solver == 'unipc':

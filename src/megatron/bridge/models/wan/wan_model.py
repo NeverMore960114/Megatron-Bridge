@@ -86,11 +86,7 @@ class WanModel(VisionModule):
         post_process (bool): Whether to apply post-processing steps.
         fp16_lm_cross_entropy (bool): Whether to use fp16 for cross-entropy loss.
         parallel_output (bool): Whether to use parallel output.
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
         transformer_decoder_layer_spec (WanLayerWithAdaLNspec): Specification for the transformer decoder layer.
-        add_encoder (bool): Whether to add an encoder.
-        add_decoder (bool): Whether to add a decoder.
         model_type (ModelType): Type of the model.
     """
 
@@ -101,8 +97,6 @@ class WanModel(VisionModule):
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
-        in_channels: int = 16,
-        out_channels: int = 16,
         transformer_decoder_layer_spec=WanLayerWithAdaLNspec,
         **kwargs,
     ):
@@ -113,12 +107,8 @@ class WanModel(VisionModule):
         self.transformer_decoder_layer_spec = transformer_decoder_layer_spec()
         self.pre_process = pre_process
         self.post_process = post_process
-        self.add_encoder = True
-        self.add_decoder = True
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
-        self.in_channels = in_channels
-        self.out_channels = out_channels
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -126,6 +116,8 @@ class WanModel(VisionModule):
 
         self.num_heads = self.config.num_attention_heads
         self.freq_dim = self.config.freq_dim
+        self.in_channels = self.config.in_channels
+        self.out_channels = self.config.out_channels
         self.patch_spatial = self.config.patch_spatial
         self.patch_temporal = self.config.patch_temporal
         self.patch_size = (self.patch_temporal, self.patch_spatial, self.patch_spatial)
@@ -189,32 +181,6 @@ class WanModel(VisionModule):
         #################################
         ########## Wan forward ##########
 
-        # DEBUGGING
-        run_debug = False
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] state_dict keys:")
-            for k, v in self.state_dict().items():
-                if "_extra_state" in k:
-                    continue
-                if hasattr(v, "shape"):
-                    print(f"[DEBUG]  {k} | shape - dtype - mean - std - norm: {tuple(v.shape)} - {v.dtype} - {v.mean().item()} - {v.std().item()} - {v.norm().item()}")
-                else:
-                    print(f"[DEBUG]  {k}")
-            print("\n\n\n")
-
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] [WanModel forward] x.shape - x.dtype - x.mean() - x.std() - x.norm(): ", x.shape, x.dtype, x.mean(), x.std(), x.norm())
-            print("[DEBUG] [WanModel forward] grid_sizes: ", grid_sizes)
-            print("[DEBUG] [WanModel forward] t: ", t)
-            print("[DEBUG] [WanModel forward] context.shape - context.dtype - context.mean() - context.std() - context.norm(): ", context.shape, context.dtype, context.mean(), context.std(), context.norm())
-            print("[DEBUG] [WanModel forward] max_seq_len: ", max_seq_len)
-            print("[DEBUG] [WanModel forward] packed_seq_params: ", packed_seq_params)
-
-
         # ============= embedders =============
 
         # run input embedding
@@ -237,11 +203,6 @@ class WanModel(VisionModule):
             # intermediate stage of pipeline
             x = self.decoder.input_tensor
 
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] [WanModel forward] (after patch_embedding) x.shape - x.dtype - x.mean() - x.std() - x.norm(): ", x.shape, x.dtype, x.mean(), x.std(), x.norm())
-            print("[DEBUG] [WanModel forward] (after patch_embedding) x:", x)
-
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
@@ -258,14 +219,6 @@ class WanModel(VisionModule):
         n_head, dim_head = self.num_heads, self.config.hidden_size // self.num_heads
         rotary_pos_emb = self.rope_embeddings(n_head, dim_head, max_seq_len, grid_sizes, t.device) # output: rotary_pos_emb.shape [s, b, 1, dim_head]
 
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] [WanModel forward] (before self.decoder) x.shape - x.dtype - x.mean() - x.std() - x.norm(): ", x.shape, x.dtype, x.mean(), x.std(), x.norm())
-            print("[DEBUG] [WanModel forward] (before self.decoder) context.shape - context.dtype - context.mean() - context.std() - context.norm(): ", context.shape, context.dtype, context.mean(), context.std(), context.norm())
-            print("[DEBUG] [WanModel forward] (before self.decoder) e0.shape - e0.dtype - e0.mean() - e0.std() - e0.norm(): ", e0.shape, e0.dtype, e0.mean(), e0.std(), e0.norm())
-            print("[DEBUG] [WanModel forward] (before self.decoder) rotary_pos_emb.shape - rotary_pos_emb.dtype - rotary_pos_emb.mean() - rotary_pos_emb.std() - rotary_pos_emb.norm(): ", rotary_pos_emb.shape, rotary_pos_emb.dtype, rotary_pos_emb.mean(), rotary_pos_emb.std(), rotary_pos_emb.norm())
-            print("[DEBUG] [WanModel forward] (before self.decoder) packed_seq_params: ", packed_seq_params)
-
         # run decoder
         x = self.decoder(
             hidden_states=x,
@@ -277,10 +230,6 @@ class WanModel(VisionModule):
             rotary_pos_sin=None,
             packed_seq_params=packed_seq_params,
         )
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] [WanModel forward] (after self.decoder) x.shape - x.dtype - x.mean() - x.std() - x.norm(): ", x.shape, x.dtype, x.mean(), x.std(), x.norm())
 
         # return if not post_process
         if not self.post_process:
@@ -297,10 +246,6 @@ class WanModel(VisionModule):
         #   However, in Wan models, we need to gather the outputs manually.
         if self.config.sequence_parallel:
             x = tensor_parallel.gather_from_sequence_parallel_region(x)
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("[DEBUG] [WanModel forward] (after self.head) x.shape - x.dtype - x.mean() - x.std() - x.norm(): ", x.shape, x.dtype, x.mean(), x.std(), x.norm())
 
         return x # output: x.shape [s, b, c * pF * pH * pW]
 

@@ -1,4 +1,18 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+# Example of running script for Wan inference.
+#     NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 examples/recipes/wan/inference_wan.py  \
+#     --task t2v-1.3B \
+#     --sizes 480*832 \
+#     --ckpt_dir /path/to/wan_checkpoints \
+#     --frame_nums 81 \
+#     --prompts "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
+#     --tensor_parallel_size 1 \
+#     --context_parallel_size 1 \
+#     --pipeline_parallel_size 1 \
+#     --sequence_parallel False \
+#     --base_seed 42 \
+#     --sample_steps 50
+
 import argparse
 import logging
 import os
