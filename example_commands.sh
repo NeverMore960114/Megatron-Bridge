@@ -1,3 +1,7 @@
+### Convert checkpoint
+See examples/conversion/convert_wan_checkpoints.py for details.
+
+
 ### Finetuning
 export HF_TOKEN=...
 export WANDB_API_KEY=...
