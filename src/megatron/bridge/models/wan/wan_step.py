@@ -18,31 +18,19 @@ from typing import Iterable
 
 import torch
 from megatron.core import parallel_state
-from megatron.core.models.gpt import GPTModel
+from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.utils import get_batch_on_this_cp_rank, get_model_config
-# from megatron.bridge.models.DiTModel.edm.edm_pipeline import EDMPipeline
+from megatron.core.utils import get_model_config
 from megatron.bridge.models.wan.flow_matching.flow_pipeline import FlowPipeline
-
-from megatron.bridge.training.config import ConfigContainer, FinetuningDatasetConfig
 from megatron.bridge.training.losses import masked_next_token_loss
 from megatron.bridge.training.state import GlobalState
-
 
 logger = logging.getLogger(__name__)
 
 def wan_data_step(qkv_format, dataloader_iter):
     batch = next(iter(dataloader_iter.iterable))
 
-    # # can we do this ???
-    # batch = get_batch_on_this_cp_rank(batch)
-
     batch = {k: v.to(device="cuda", non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
-
-
-    # ??? Should we do the padding here, by padding to the longest sequence length in the batch?
-    # ??? Or should we do the padding in the TaskEncoder?
-    # => do task encoder padding here
 
     # Construct packed sequence parameters
     if ("seq_len_q" in batch) and ("seq_len_kv" in batch):
@@ -69,59 +57,16 @@ def wan_data_step(qkv_format, dataloader_iter):
     return batch
 
 
-def get_batch_on_this_cp_rank(data):
-    """Split the data for context parallelism."""
-    from megatron.core import mpu
-
-    cp_size = mpu.get_context_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank()
-
-    t = 16
-    if cp_size > 1:
-        # cp split on seq_length, for video_latent, noise_latent and pos_ids
-        assert t % cp_size == 0, "t must divisibly by cp_size"
-        num_valid_tokens_in_ub = None
-        if "loss_mask" in data and data["loss_mask"] is not None:
-            num_valid_tokens_in_ub = data["loss_mask"].sum()
-
-        for key, value in data.items():
-            if (value is not None) and (key in ["video", "video_latent", "noise_latent", "pos_ids"]):
-                if len(value.shape) > 5:
-                    value = value.squeeze(0)
-                B, C, T, H, W = value.shape
-                if T % cp_size == 0:
-                    # FIXME packed sequencing
-                    data[key] = value.view(B, C, cp_size, T // cp_size, H, W)[:, :, cp_rank, ...].contiguous()
-                else:
-                    # FIXME packed sequencing
-                    data[key] = value.view(B, C, T, cp_size, H // cp_size, W)[:, :, :, cp_rank, ...].contiguous()
-        loss_mask = data["loss_mask"]
-        data["loss_mask"] = loss_mask.view(loss_mask.shape[0], cp_size, loss_mask.shape[1] // cp_size)[
-            :, cp_rank, ...
-        ].contiguous()
-        data["num_valid_tokens_in_ub"] = num_valid_tokens_in_ub
-
-    return data
-
-
 class WanForwardStep:
     def __init__(self):
         self.diffusion_pipeline = FlowPipeline()
 
 
     def __call__(
-        self, state: GlobalState, data_iterator: Iterable, model: GPTModel, return_schedule_plan: bool = False
+        self, state: GlobalState, data_iterator: Iterable, model: VisionModule
     ) -> tuple[torch.Tensor, partial]:
-        """Forward training step.
-
-        Args:
-            state: Global state for the run
-            data_iterator: Input data iterator
-            model: The GPT Model
-            return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
-
-        Returns:
-            tuple containing the output tensor and the loss function
+        """
+        Forward training step.
         """
         timers = state.timers
         straggler_timer = state.straggler_timer
@@ -140,30 +85,18 @@ class WanForwardStep:
         check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
         check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
 
-        # DEBUGGING
-        run_debug = False
-        if run_debug:
-            print("---- Sample info [WanForwardStep] ----")
-            print(f"batch['video_latents'] shape: {batch['video_latents'].shape}")
-            print(f"batch['context_embeddings'] shape: {batch['context_embeddings'].shape}")
-            print(f"batch['loss_mask'] shape: {batch['loss_mask'].shape}")
-            print(f"batch['grid_sizes']: {batch['grid_sizes']}")
-            print(f"batch['packed_seq_params']: {batch['packed_seq_params']}")
-
-
         # run diffusion training step
         with straggler_timer:
             if parallel_state.is_pipeline_last_stage():
-                output_batch, loss = self.diffusion_pipeline.training_step(model, batch)
+                output_batch, loss, split_loss_mask = self.diffusion_pipeline.training_step(model, batch)
                 output_tensor = torch.mean(loss, dim=-1)
+                batch["loss_mask"] = split_loss_mask
             else:
                 output_tensor = self.diffusion_pipeline.training_step(model, batch)
 
-
         # DEBUGGING
-        # ??? do we need to gather output with sequence or context parallelism here
-        # ??? especially when we have pipeline parallelism
-
+        # TODO: do we need to gather output with sequence or context parallelism here
+        #       especially when we have pipeline parallelism
 
         loss = output_tensor
         if "loss_mask" not in batch or batch["loss_mask"] is None:

@@ -16,200 +16,153 @@ from typing import Any, Callable, Dict, Optional, Tuple, List
 
 import numpy as np
 import torch
-import torch.distributed
 from megatron.core import parallel_state
-# from megatron.bridge.models.DiTModel.sampler.context_parallel import cat_outputs_cp ???
 from torch import Tensor
 from diffusers import WanPipeline
+from megatron.bridge.models.wan.flow_matching.time_shift_utils import compute_density_for_timestep_sampling
+from megatron.bridge.models.wan.utils.utils import patchify, split_inputs_cp
 
 class FlowPipeline:
-    """
-    FlowPipeline is a class that implements a diffusion model pipeline for video generation. It includes methods for
-    initializing the pipeline, encoding and decoding video data, performing training steps, denoising, and generating
-    samples.
-    Attributes:
-        ...
-    Methods:
-        ...
-    """
 
     def __init__(
         self,
-        model_id="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        vae=None,
+        model_id="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         seed=1234,
     ):
         """
         Initializes the FlowPipeline with the given parameters.
-
-        Args:
-            net: The DiT model.
-            vae: The Video Tokenizer (optional).
-            seed (int): Random seed for reproducibility.
-
-        Attributes:
-            vae: The Video Tokenizer.
-            net: The DiT model.
-            _noise_generator: Generator for noise.
-            seed (int): Random seed for reproducibility.
-            input_data_key (str): Key for input data.
-            input_image_key (str): Key for input images.
-            tensor_kwargs (dict): Tensor keyword arguments for device and dtype.
         """
-        self.vae = vae
+        self.pipe = WanPipeline.from_pretrained(model_id, vae=None, torch_dtype=torch.float32, text_encoder=None)
 
-        self.seed = seed
-        self._noise_generator = None
-
-        self.input_data_key = "video"
-        self.input_image_key = "images_1024"
-        self.tensor_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-
-        pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.float32)
-        self.scheduler = pipe.scheduler
-
-
-    def _initialize_generators(self):
-        """
-        Initializes the random number generators for noise
-
-        This method sets up a generator:
-        1. A PyTorch generator for noise, seeded with a combination of the base seed and the data parallel rank.
-
-        Returns:
-            None
-        """
-        noise_seed = self.seed + 100 * parallel_state.get_data_parallel_rank(with_context_parallel=True)
-        noise_level_seed = self.seed + 100 * parallel_state.get_data_parallel_rank(with_context_parallel=False)
-        self._noise_generator = torch.Generator(device="cuda")
-        self._noise_generator.manual_seed(noise_seed)
 
     def training_step(
-        self, model, data_batch: dict[str, torch.Tensor]
+        self, 
+        model, 
+        data_batch: dict[str, torch.Tensor],
+        # Flow matching parameters
+        use_sigma_noise: bool = True,
+        timestep_sampling: str = "uniform",
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        flow_shift: float = 3.0,
+        mix_uniform_ratio: float = 0.1,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """
-        Performs a single training step for the diffusion model.
+        Performs a single training step using flow matching algorithm.
 
         This method is responsible for executing one iteration of the model's training. It involves:
-        1. Adding noise to the input data using the SDE process.
-        2. Passing the noisy data through the network to generate predictions.
-        3. Computing the loss based on the difference between the predictions and the original data.
-
-        Args:
-            data_batch (dict): raw data batch draw from the training data loader.
-
-        Returns:
-            A tuple with the output batch and the computed loss.
+        1. Generate noise and add it to the input data.
+        2. Pass the noisy data through the network to generate predictions.
+        3. Compute the loss based on the difference between the predictions and target.
         """
-
-        # DEBUGGING
-        run_debug = False
-        if run_debug and torch.distributed.get_rank()==0:
-            print("---- Sample info [FlowPipeline.training_step] ----")
-            print(f"data_batch['video_latents'] shape: {data_batch['video_latents'].shape}")
-            print(f"data_batch['context_embeddings'] shape: {data_batch['context_embeddings'].shape}")
-            print(f"data_batch['loss_mask'] shape: {data_batch['loss_mask'].shape}")
-            print(f"data_batch['grid_sizes']: {data_batch['grid_sizes']}")
-            print(f"data_batch['packed_seq_params']: {data_batch['packed_seq_params']}")
-            print(f"data_batch['max_video_seq_len']: {data_batch['max_video_seq_len']}")
-
 
         video_latents = data_batch['video_latents']
         max_video_seq_len = data_batch['max_video_seq_len']
         context_embeddings = data_batch['context_embeddings']
+        loss_mask = data_batch['loss_mask']
         grid_sizes = data_batch['grid_sizes']
         packed_seq_params = data_batch['packed_seq_params']
+        video_metadata = data_batch['video_metadata']
 
-
-        # Get the input data to noise and denoise~(image, video) and the corresponding conditioner.
         self.model = model
-        
 
-        # Get timesteps
         batch_size = video_latents.shape[1]
         device = video_latents.device
-        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (batch_size,), device=device)
 
-        # Generate noise
-        # shape of latents is [S, B, (C pF pH pW)]
-        noise_batch = torch.randn_like(video_latents)
+        # # # DEBUGGING precision
+        # # import torch.cuda.amp as amp
+        # # with amp.autocast(dtype=torch.bfloat16):
+        # #     # Pass through model
+        # #     ...
 
-
-        # DEBUGGING
-        if run_debug and torch.distributed.get_rank()==0:
-            print("---- Sample info [FlowPipeline.training_step] ----")
-            print(f"noise_batch shape: {noise_batch.shape}")
-            print(f"timesteps shape: {timesteps.shape}")
-            print(f"video_latents shape: {video_latents.shape}")
-            print("--------------------------------")
-
-        # ??? can this add_noise method used for videos of different sizes and just padding?
-        #  => it should be, because the main formula is: noisy_latents = alpha_t * original_samples + sigma_t * noise
-        # Apply scheduler noise based on timesteps
-        # DEBUGGING
-        # bring to shape [batch_size, ...] to run add_noise
-        noisy_latents = self.scheduler.add_noise(video_latents.transpose(0, 1), noise_batch.transpose(0, 1), timesteps)
-        noisy_latents = noisy_latents.transpose(0, 1)
-
-        # Pass through model
-        # noise only needed at the last stage
-        if parallel_state.is_pipeline_last_stage():
-            output_batch, loss = self.compute_loss(
-                noisy_latents, noise_batch, timesteps, context_embeddings, grid_sizes, packed_seq_params, max_video_seq_len
-            )
-
-            return output_batch, loss
+        # ========================================================================
+        # Flow Matching Timestep Sampling
+        # ========================================================================
+        
+        num_train_timesteps = self.pipe.scheduler.config.num_train_timesteps
+        
+        if use_sigma_noise:
+            use_uniform = torch.rand(1).item() < mix_uniform_ratio
+            
+            if use_uniform or timestep_sampling == "uniform":
+                # Pure uniform: u ~ U(0, 1)
+                u = torch.rand(size=(batch_size,), device=device)
+                sampling_method = "uniform"
+            else:
+                # Density-based sampling
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=timestep_sampling,
+                    batch_size=batch_size,
+                    logit_mean=logit_mean,
+                    logit_std=logit_std,
+                ).to(device)
+                sampling_method = timestep_sampling
+            
+            # Apply flow shift: σ = shift/(shift + (1/u - 1))
+            u_clamped = torch.clamp(u, min=1e-5)  # Avoid division by zero
+            sigma = flow_shift / (flow_shift + (1.0 / u_clamped - 1.0))
+            sigma = torch.clamp(sigma, 0.0, 1.0)
+            
         else:
-            hidden_states = self.compute_loss(
-                noisy_latents, timesteps, context_embeddings, grid_sizes, packed_seq_params, max_video_seq_len
-            )
-            return hidden_states
+            # Simple uniform without shift
+            u = torch.rand(size=(batch_size,), device=device)
+            sigma = u
+            sampling_method = "uniform_no_shift"
 
-    # def get_data_and_condition(self, data_batch: dict[str, Tensor]) -> Tuple[Tensor]:
-    #     """
-    #     Retrieves data and conditioning for model input.
+        # ========================================================================
+        # Manual Flow Matching Noise Addition
+        # ========================================================================
+        
+        # Generate noise
+        noise = torch.randn_like(torch.ones([1, 16, grid_sizes[0][0], grid_sizes[0][1]*2, grid_sizes[0][2]*2], device=video_latents.device), dtype=torch.float32)
+        noise = patchify(noise, (1, 2, 2))[0].unsqueeze(1)
 
-    #     Args:
-    #         data_batch: Batch of input data.
+        # CRITICAL: Manual flow matching (NOT scheduler.add_noise!)
+        # x_t = (1 - σ) * x_0 + σ * ε
+        sigma_reshaped = sigma.view(1, batch_size, 1)
+        noisy_latents = (
+            (1.0 - sigma_reshaped) * video_latents.float() 
+            + sigma_reshaped * noise
+        )
+        
+        # Timesteps for model [0, 1000]
+        timesteps = sigma * num_train_timesteps
 
-    #     Returns:
-    #         ...
-    #     """
-    #     ...
-    #     return None
+        # ========================================================================
+        # Cast model inputs to bf16
+        # ========================================================================
 
-    def compute_loss(
-        self, 
-        video_latents: torch.Tensor, 
-        noise_batch: torch.Tensor, 
-        timesteps: torch.Tensor, 
-        context_embeddings: torch.Tensor, 
-        grid_sizes: List[Tuple[int, int, int]], 
-        packed_seq_params: dict,
-        max_video_seq_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Computes the loss for the given latents, timesteps, context_embeddings, grid_sizes, and packed_seq_params.
-        """
+        video_latents = video_latents.to(torch.bfloat16)
+        noisy_latents = noisy_latents.to(torch.bfloat16)
+        context_embeddings = context_embeddings.to(torch.bfloat16)
+        timesteps = timesteps.to(torch.bfloat16)
 
-        # ??? the shape of latents is [S, B, (ph pw pt C)]
-        # ??? the shape of noise is [S, B, (ph pw pt C)]
-        # loss_mask is [S, B], will be transffered in WanForwardStep to combine with loss to get the final loss
+        # ========================================================================
+        # Split accross context parallelism
+        # ========================================================================
+        
+        if parallel_state.get_context_parallel_world_size() > 1:
+            video_latents = split_inputs_cp(video_latents, 0)
+            noisy_latents = split_inputs_cp(noisy_latents, 0)
+            noise = split_inputs_cp(noise, 0)
+            context_embeddings = split_inputs_cp(context_embeddings, 0)
+            split_loss_mask = split_inputs_cp(loss_mask, 0)
+        else:
+            video_latents = video_latents
+            noisy_latents = noisy_latents
+            noise = noise
+            context_embeddings = context_embeddings
+            split_loss_mask = loss_mask
 
-        # condition would be:
-        # t5_text_embeddings, t5_text_mask, seq_len_q, seq_len_kv, pos_ids, latent_shape, grid_sizes
-        # the shape of t5_text_embeddings is [S, B, (ph pw pt C)]
-        # the shape of t5_text_mask is [S, B]
-        # the shape of seq_len_q is [B]
-        # the shape of seq_len_kv is [B]
-        # the shape of pos_ids is [S, B, (ph pw pt C)]
-        # the shape of latent_shape is [B, 4]
-        # the shape of grid_sizes is [B, 3]
 
-        # Pass through model
+        # ========================================================================
+        # Forward Pass
+        # ========================================================================
+        
         if parallel_state.is_pipeline_last_stage():
-            model_predict = self.model(
-                x = video_latents,
+        
+            model_pred = self.model(
+                x = noisy_latents,
                 grid_sizes = grid_sizes,
                 t = timesteps,
                 context = context_embeddings,
@@ -217,25 +170,41 @@ class FlowPipeline:
                 packed_seq_params=packed_seq_params,
             )
 
-            # Compute target based on prediction type
-            if self.scheduler.config.prediction_type == "epsilon":
-                target = noise_batch
-            elif self.scheduler.config.prediction_type == "v_prediction":
-                target = self.scheduler.get_velocity(latents, noise_batch, timesteps)
-            elif self.scheduler.config.prediction_type == "flow_prediction":
-                # Flow matching
-                target = video_latents - noise_batch
-            else:
-                raise ValueError(f"Unknown prediction type: {self.scheduler.config.prediction_type}")
+            # ========================================================================
+            # Target: Flow Matching Velocity
+            # ========================================================================
+            
+            # Flow matching target: v = ε - x_0
+            target = noise - video_latents.float()
+            
+            # ========================================================================
+            # Loss with Flow Weighting
+            # ========================================================================
+            
+            loss = torch.nn.functional.mse_loss(
+                model_pred.float(),
+                target.float(),
+                reduction="none"
+            )
 
-            # Compute loss
-            loss = torch.nn.functional.mse_loss(model_predict, target, reduction="mean")
+            # Flow weight: w = 1 + shift * σ
+            loss_weight = 1.0 + flow_shift * sigma # shape [batch_size]
+            loss_weight = loss_weight.view(1, batch_size, 1).to(device) # shape [1, batch_size, 1]
+            unweighted_loss = loss
+            weighted_loss = (loss * loss_weight) # shape [seq_length / cp_size, batch_size, -1]
 
-            return model_predict, loss
+            # Safety check
+            mean_weighted_loss = weighted_loss.mean()
+            if torch.isnan(mean_weighted_loss) or mean_weighted_loss > 100:
+                print(f"[ERROR] Loss explosion! Loss={mean_weighted_loss.item():.3f}")
+                print(f"[DEBUG] Stopping training - check hyperparameters")
+                raise ValueError(f"Loss exploded: {mean_weighted_loss.item()}")
+
+            return model_pred, weighted_loss, split_loss_mask
 
         else:
             hidden_states = self.model(
-                x = video_latents,
+                x = noisy_latents,
                 grid_sizes = grid_sizes,
                 t = timesteps,
                 context = context_embeddings,

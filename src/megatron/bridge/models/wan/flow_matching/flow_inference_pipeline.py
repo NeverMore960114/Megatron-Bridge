@@ -1,4 +1,3 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import logging
 import math
@@ -6,6 +5,7 @@ import os
 import random
 import sys
 import types
+import re
 from contextlib import contextmanager
 from functools import partial
 
@@ -24,8 +24,10 @@ from megatron.bridge.models.wan.inference.utils.fm_solvers import (
     retrieve_timesteps,
 )
 from megatron.bridge.models.wan.inference.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from megatron.bridge.models.wan.utils.utils import grid_sizes_calculation, patchify
 from megatron.core import parallel_state
 from torch.nn import functional as F
+from megatron.bridge.models.wan.utils.utils import split_inputs_cp, cat_outputs_cp
 
 import math
 from typing import Tuple, Union
@@ -36,9 +38,13 @@ class FlowInferencePipeline:
         self,
         config,
         checkpoint_dir,
+        checkpoint_step=None,
+        t5_checkpoint_dir=None,
+        vae_checkpoint_dir=None,
         device_id=0,
         rank=0,
         t5_cpu=False,
+
         tensor_parallel_size=1,
         context_parallel_size=1,
         pipeline_parallel_size=1,
@@ -53,6 +59,10 @@ class FlowInferencePipeline:
                 Object containing model parameters initialized from config.py
             checkpoint_dir (`str`):
                 Path to directory containing model checkpoints
+            t5_checkpoint_dir (`str`, *optional*, defaults to None):
+                Optional directory containing T5 checkpoint and tokenizer; falls back to `checkpoint_dir` if None.
+            vae_checkpoint_dir (`str`, *optional*, defaults to None):
+                Optional directory containing VAE checkpoint; falls back to `checkpoint_dir` if None.
             device_id (`int`,  *optional*, defaults to 0):
                 Id of target GPU device
             rank (`int`,  *optional*, defaults to 0):
@@ -76,18 +86,22 @@ class FlowInferencePipeline:
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
-            checkpoint_path=os.path.join(checkpoint_dir, config.t5_checkpoint),
-            tokenizer_path=os.path.join(checkpoint_dir, config.t5_tokenizer),
+            checkpoint_path=os.path.join(t5_checkpoint_dir, config.t5_checkpoint),
+            tokenizer_path=os.path.join(t5_checkpoint_dir, config.t5_tokenizer),
             shard_fn=None)
 
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size        
         self.vae = WanVAE(
-            vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
+            vae_pth=os.path.join(vae_checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        wan_checkpoint_dir = os.path.join(checkpoint_dir, "iter_0000000")
+        wan_checkpoint_dir = self._select_checkpoint_dir(checkpoint_dir, checkpoint_step)
         self.model = self.setup_model_from_checkpoint(wan_checkpoint_dir)
+        
+        # DEBUGGING
+        # set qkv_format to to "thd" for context parallelism
+        self.model.config.qkv_format = "sbhd"
 
         # set self.sp_size=1 for later use, just to respect the original Wan inference code
         self.sp_size = 1
@@ -97,39 +111,6 @@ class FlowInferencePipeline:
         self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
-
-
-    def patchify(self, x, patch_size):
-        """
-        Convert a list of reconstructed video tensor into patch embeddings.
-        This method is the inverse of `unpatchify`.
-
-        Args:
-            x (list[torch.Tensor]): list of tensors, each with shape [c, F_patches * pF, H_patches * pH, W_patches * pW]
-            patch_size (tuple): (pF, pH, pW)
-
-        Returns:
-            torch.Tensor: shape [ (F_patches * H_patches * W_patches), (c * pF * pH * pW)],
-        """
-        out = []
-        for u in x:
-            c, F_pF, H_pH, W_pW = u.shape
-            pF, pH, pW = patch_size
-            assert F_pF % pF == 0 and H_pH % pH == 0 and W_pW % pW == 0, \
-                "Spatial dimensions must be divisible by patch size."
-
-            F_patches, H_patches, W_patches = F_pF // pF, H_pH // pH, W_pW // pW
-
-            # split spatial dims into (grid, patch) and reorder to match original patch layout:
-            # start: (c, F_patches * pF, H_patches * pH, W_patches * pW)
-            # reshape -> (c, F_patches, pF, H_patches, pH, W_patches, pW)
-            # permute -> (F_patches, H_patches, W_patches, pF, pH, pW, c)
-            t = u.reshape(c, F_patches, pF, H_patches, pH, W_patches, pW)
-            t = t.permute(1, 3, 5, 0, 2, 4, 6)
-
-            num_patches = F_patches * H_patches * W_patches
-            out.append(t.reshape(num_patches, c * (pF * pH * pW)))
-        return out
         
 
     def unpatchify(self, x: torch.Tensor, grid_sizes: torch.Tensor, out_dim: int) -> list[torch.Tensor]:
@@ -182,47 +163,41 @@ class FlowInferencePipeline:
         )
         if isinstance(model, list):
             model = model[0]
+        if hasattr(model, "module"):
+            model = model.module
 
         return model
 
-
-    def grid_sizes_calculation(
-        self,
-        input_shape: Tuple[int, int, int],  # (F_latents, H_latents, W_latents)
-        kernel_size: Union[int, Tuple[int, int, int]],
-        stride: Union[int, Tuple[int, int, int]] = 1,
-        padding: Union[int, Tuple[int, int, int]] = 0,
-        dilation: Union[int, Tuple[int, int, int]] = 1
-    ) -> Tuple[int, int, int]:
+    def _select_checkpoint_dir(self, base_dir: str, checkpoint_step) -> str:
         """
-        Compute the (f,h,w) output spatial/temporal dimensions of a Conv3d patch embedder.
-
-        Args:
-            input_shape: (F_latents, H_latents, W_latents)
-            kernel_size, stride, padding, dilation of the Conv3d patch embedder: either int or 3-tuple
-
-        Returns:
-            (F_patches, H_patches, W_patches)
+        Resolve checkpoint directory:
+        - If checkpoint_step is provided, use base_dir/iter_{step:07d}
+        - Otherwise, pick the largest iter_######## subdirectory under base_dir
         """
-        
-        def to_tuple(x):
-            return (x, x, x) if isinstance(x, int) else x
-        
-        kernel_size = to_tuple(kernel_size)
-        stride = to_tuple(stride)
-        padding = to_tuple(padding)
-        dilation = to_tuple(dilation)
-        
-        D_in, H_in, W_in = input_shape
-        
-        def calc_out(in_size, k, s, p, d):
-            return math.floor((in_size + 2*p - d*(k - 1) - 1) / s + 1)
-        
-        D_out = calc_out(D_in, kernel_size[0], stride[0], padding[0], dilation[0])
-        H_out = calc_out(H_in, kernel_size[1], stride[1], padding[1], dilation[1])
-        W_out = calc_out(W_in, kernel_size[2], stride[2], padding[2], dilation[2])
-        
-        return [D_out, H_out, W_out]
+        if checkpoint_step is not None:
+            path = os.path.join(base_dir, f"iter_{int(checkpoint_step):07d}")
+            if os.path.isdir(path):
+                logging.info(f"Using specified checkpoint: {path}")
+                return path
+            raise FileNotFoundError(f"Specified checkpoint step {checkpoint_step} not found at {path}")
+
+        if not os.path.isdir(base_dir):
+            raise FileNotFoundError(f"Checkpoint base directory does not exist: {base_dir}")
+
+        pattern = re.compile(r"^iter_(\d+)$")
+        try:
+            _, latest_path = max(
+                ((int(pattern.match(e.name).group(1)), e.path)
+                 for e in os.scandir(base_dir)
+                 if e.is_dir() and pattern.match(e.name)),
+                key=lambda x: x[0],
+            )
+        except ValueError:
+            raise FileNotFoundError(
+                f"No checkpoints found under {base_dir}. Expected subdirectories named like 'iter_0001800'.")
+
+        logging.info(f"Auto-selected latest checkpoint: {latest_path}")
+        return latest_path
 
 
     def forward_pp_step(
@@ -419,10 +394,9 @@ class FlowInferencePipeline:
 
 
         # calculate grid_sizes
-        grid_sizes = [self.grid_sizes_calculation(
+        grid_sizes = [grid_sizes_calculation(
             input_shape =u.shape[1:], 
-            kernel_size=self.model.patch_size, 
-            stride=self.model.patch_size,
+            patch_size=self.model.patch_size,
             ) for u in noises]
         grid_sizes = torch.tensor(grid_sizes, dtype=torch.long)
 
@@ -482,12 +456,12 @@ class FlowInferencePipeline:
                 "self_attention": PackedSeqParams(
                     cu_seqlens_q=cu_q,
                     cu_seqlens_kv=cu_kv_self,
-                    qkv_format="sbhd",
+                    qkv_format=self.model.config.qkv_format,
                 ),
                 "cross_attention": PackedSeqParams(
                     cu_seqlens_q=cu_q,
                     cu_seqlens_kv=cu_kv_cross,
-                    qkv_format="sbhd",
+                    qkv_format=self.model.config.qkv_format,
                 ),
             }
             
@@ -501,7 +475,7 @@ class FlowInferencePipeline:
 
                 # patchify latents
                 unpatchified_latents = latents
-                latents = self.patchify(latents, self.patch_size)
+                latents = patchify(latents, self.patch_size)
                 # pad to have same length
                 for i in range(batch_size):
                     latents[i] = F.pad(latents[i], (0, 0, 0, max_video_seq_len - latents[i].shape[0]))
@@ -512,6 +486,12 @@ class FlowInferencePipeline:
                 timestep = [t] * batch_size
                 timestep = torch.stack(timestep)
 
+                # run context parallelism slitting
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    latent_model_input = split_inputs_cp(latent_model_input, 0)
+                    arg_c['context'] = split_inputs_cp(arg_c['context'], 0)
+                    arg_null['context'] = split_inputs_cp(arg_null['context'], 0)
+
                 self.model.to(self.device)
                 noise_pred_cond = self.forward_pp_step(
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, arg_c=arg_c)
@@ -519,6 +499,15 @@ class FlowInferencePipeline:
                 noise_pred_uncond = self.forward_pp_step(
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, arg_c=arg_null)
 
+                # run context parallelism gathering
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    arg_c['context'] = cat_outputs_cp(arg_c['context'], 0) # we need to cat the context back together for the next timestep
+                    arg_null['context'] = cat_outputs_cp(arg_null['context'], 0) # we need to cat the context back together for the next timestep
+                    # TODO: does this step slow down speed???
+                    noise_pred_cond = noise_pred_cond.contiguous()
+                    noise_pred_uncond = noise_pred_uncond.contiguous()
+                    noise_pred_cond = cat_outputs_cp(noise_pred_cond, 0)
+                    noise_pred_uncond = cat_outputs_cp(noise_pred_uncond, 0)
 
                 # run unpatchify
                 unpatchified_noise_pred_cond = noise_pred_cond

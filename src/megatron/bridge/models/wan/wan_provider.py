@@ -38,6 +38,8 @@ class WanModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
     layernorm_epsilon: float = 1e-6
     normalization: str = "RMSNorm"
     layernorm_zero_centered_gamma: bool = False
+    add_qkv_bias: bool = True
+    rotary_interleaved: bool = True
     hidden_dropout: float = 0
     attention_dropout: float = 0
     fp16_lm_cross_entropy: bool = False
@@ -48,6 +50,8 @@ class WanModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
     # these attributes are unused for images/videos, we just set because bridge training requires for LLMs
     seq_length: int = 1024
     share_embeddings_and_output_weights: bool = False
+    vocab_size: int = 25256 * 8
+    make_vocab_size_divisible_by: int = 128
 
     # images/videos attributes
     in_channels: int = 16

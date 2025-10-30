@@ -1,5 +1,7 @@
 import torch
 from torch.cuda import amp
+from megatron.bridge.models.wan.utils.utils import split_inputs_cp
+from megatron.core import parallel_state
 
 class Wan3DRopeEmbeddings(torch.nn.Module):
     """
@@ -20,7 +22,7 @@ class Wan3DRopeEmbeddings(torch.nn.Module):
         freqs = torch.outer(
             torch.arange(max_position_len),
             1.0 / torch.pow(theta,
-                            torch.arange(0, dim_head, 2).to(torch.float64).div(dim_head)))
+                            torch.arange(0, dim_head, 2).div(dim_head)))
         return freqs
 
     def forward(self, n_head, dim_head, max_seq_len, grid_sizes, device):
@@ -56,6 +58,8 @@ class Wan3DRopeEmbeddings(torch.nn.Module):
         freqs_real = torch.cat(freqs_real, dim=1)
 
         # TODO: if run context/sequence related parallel, then we need to scatter 
-        # the freqs_real to the context parallel region, using specific method "get_pos_emb_on_this_cp_rank"
+        # the freqs_real to the context parallel region, using specific cp_rank split method
+        if parallel_state.get_context_parallel_world_size() > 1:
+            freqs_real = split_inputs_cp(freqs_real, 0)
 
         return freqs_real

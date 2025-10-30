@@ -219,7 +219,11 @@ def build_train_valid_test_data_loaders(
         valid_dataloader = build_pretraining_data_loader(
             valid_ds,
             train_state.consumed_valid_samples,
-            "cyclic",
+            # DEBUGGING
+            # known issue: 
+            # https://nvidia.slack.com/archives/C09MX7UEB0W/p1761316355203679
+            # "cyclic",
+            "external",
             cfg.train.micro_batch_size,
             cfg.dataset.num_workers,
             cfg.dataset.data_sharding,

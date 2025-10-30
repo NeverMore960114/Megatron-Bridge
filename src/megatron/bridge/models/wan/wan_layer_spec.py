@@ -1,3 +1,4 @@
+
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,7 +66,7 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        return super().forward(x).type_as(x)
 
 
 @dataclass
@@ -206,7 +207,7 @@ class WanSelfAttention(SelfAttention):
         if self.q_layernorm is not None:
             if self.layernorm_across_head:                
                 q_flat = query.reshape(query.size(0), query.size(1), -1).contiguous()  # [sq, b, np*hn]
-                q_flat = self.q_layernorm(q_flat.float()) # Wan RMSNorm cast input to float32
+                q_flat = self.q_layernorm(q_flat)
                 query = q_flat.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)  # [sq, b, np, hn]
             else:
                 query = self.q_layernorm(query.contiguous())
@@ -214,7 +215,7 @@ class WanSelfAttention(SelfAttention):
         if self.k_layernorm is not None:
             if self.layernorm_across_head:
                 k_flat = key.reshape(key.size(0), key.size(1), -1).contiguous()
-                k_flat = self.k_layernorm(k_flat.float()) # Wan RMSNorm cast input to float32
+                k_flat = self.k_layernorm(k_flat)
                 key = k_flat.view(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
             else:
                 key = self.k_layernorm(key.contiguous())
@@ -333,7 +334,7 @@ class WanCrossAttention(CrossAttention):
         if self.q_layernorm is not None:
             if self.layernorm_across_head:
                 q_flat = query.reshape(query.size(0), query.size(1), -1).contiguous()  # [sq, b, np*hn]
-                q_flat = self.q_layernorm(q_flat.float()) # Wan RMSNorm cast input to float32
+                q_flat = self.q_layernorm(q_flat)
                 query = q_flat.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)  # [sq, b, np, hn]
             else:
                 query = self.q_layernorm(query.contiguous())
@@ -341,7 +342,7 @@ class WanCrossAttention(CrossAttention):
         if self.k_layernorm is not None:
             if self.layernorm_across_head:
                 k_flat = key.reshape(key.size(0), key.size(1), -1).contiguous()
-                k_flat = self.k_layernorm(k_flat.float()) # Wan RMSNorm cast input to float32
+                k_flat = self.k_layernorm(k_flat)
                 key = k_flat.view(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
             else:
                 key = self.k_layernorm(key.contiguous())
@@ -384,10 +385,7 @@ class WanAdaLN(MegatronModule):
         setattr(self.modulation, "sequence_parallel", config.sequence_parallel)
 
     def forward(self, timestep_emb):
-        assert timestep_emb.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + timestep_emb).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        e = (self.modulation + timestep_emb).chunk(6, dim=1)
         return e
 
     # @jit_fuser
@@ -490,7 +488,7 @@ class WanLayerWithAdaLN(TransformerLayer):
 
         # adaLN with scale + shift + gate
         pre_full_attn_layernorm_output_ada = self.adaLN.modulate(
-            self.norm1(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            self.norm1(hidden_states),
             shift=shift_full,
             scale=scale_full,
         )
@@ -506,13 +504,12 @@ class WanLayerWithAdaLN(TransformerLayer):
         if bias is not None:
             attention_output = attention_output + bias
 
-        with amp.autocast(dtype=torch.float32): 
-            hidden_states = self.adaLN.scale_add(residual=hidden_states, x=attention_output, gate=gate_full)
+        hidden_states = self.adaLN.scale_add(residual=hidden_states, x=attention_output, gate=gate_full)
 
         # ******************************************** cross attention ******************************************************
 
         attention_output, bias = self.cross_attention(
-            self.norm3(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            self.norm3(hidden_states),
             attention_mask=context_mask,
             key_value_states=context,
             packed_seq_params=packed_seq_params['cross_attention'],
@@ -525,7 +522,7 @@ class WanLayerWithAdaLN(TransformerLayer):
         # ******************************************** mlp ******************************************************
 
         pre_mlp_layernorm_output_ada = self.adaLN.modulate(
-            self.norm2(hidden_states.float()), # Wan's LayerNorm implementation forward pass casts input to float32
+            self.norm2(hidden_states),
             shift=shift_mlp,
             scale=scale_mlp,
         )
@@ -534,9 +531,7 @@ class WanLayerWithAdaLN(TransformerLayer):
         if bias is not None:
            mlp_output = mlp_output + bias
 
-        with amp.autocast(dtype=torch.float32):
-            hidden_states = self.adaLN.scale_add(residual=hidden_states, x=mlp_output, gate=gate_mlp)
-            
+        hidden_states = self.adaLN.scale_add(residual=hidden_states, x=mlp_output, gate=gate_mlp)
 
         # TODO: Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

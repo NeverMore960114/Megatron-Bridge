@@ -1,9 +1,10 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 # Example of running script for Wan inference.
 #     NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 examples/recipes/wan/inference_wan.py  \
 #     --task t2v-1.3B \
 #     --sizes 480*832 \
-#     --ckpt_dir /path/to/wan_checkpoints \
+#     --checkpoint_dir /path/to/wan_checkpoint_dir \
+#     --t5_checkpoint_dir /path/to/t5_checkpoint_dir \
+#     --vae_checkpoint_dir /path/to/vae_checkpoint_dir \
 #     --frame_nums 81 \
 #     --prompts "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
 #     --tensor_parallel_size 1 \
@@ -32,11 +33,6 @@ from megatron.bridge.models.wan.flow_matching.flow_inference_pipeline import Flo
 from megatron.bridge.models.wan.inference.configs import SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from megatron.bridge.models.wan.inference.utils.utils import cache_video, str2bool
 
-# DEBUGGING
-import numpy as np
-np.set_printoptions(precision=10, suppress=False)
-torch.set_printoptions(precision=6, sci_mode=False)
-
 EXAMPLE_PROMPT = {
     "t2v-1.3B": {
         "prompt":
@@ -51,7 +47,9 @@ EXAMPLE_PROMPT = {
 
 def _validate_args(args):
     # Basic check
-    assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
+    assert args.checkpoint_dir is not None, "Please specify the checkpoint directory."
+    assert args.t5_checkpoint_dir is not None, "Please specify the T5 checkpoint directory."
+    assert args.vae_checkpoint_dir is not None, "Please specify the VAE checkpoint directory."
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
@@ -90,7 +88,7 @@ def _parse_args():
         nargs="+",
         default=None,
         choices=list(SIZE_CONFIGS.keys()),
-        help="A list of sizes to generate multiple images or videos. Example: --sizes 1280*720 1920*1080"
+        help="A list of sizes to generate multiple images or videos (WIDTH*HEIGHT). Example: --sizes 1280*720 1920*1080"
     )
     parser.add_argument(
         "--frame_nums",
@@ -100,10 +98,28 @@ def _parse_args():
         help="List of frame counts (each should be 4n+1). Broadcasts if single value."
     )
     parser.add_argument(
-        "--ckpt_dir",
+        "--checkpoint_dir",
         type=str,
         default=None,
-        help="The path to the checkpoint directory.")
+        help="The path to the main WAN checkpoint directory.")
+    parser.add_argument(
+        "--checkpoint_step",
+        type=int,
+        default=None,
+        help=(
+            "Optional training step to load, e.g. 1800 -> iter_0001800. "
+            "If not provided, the latest (largest) step in --checkpoint_dir is used.")
+    )
+    parser.add_argument(
+        "--t5_checkpoint_dir",
+        type=str,
+        default=None,
+        help="Optional directory containing T5 checkpoint/tokenizer")
+    parser.add_argument(
+        "--vae_checkpoint_dir",
+        type=str,
+        default=None,
+        help="Optional directory containing VAE checkpoint")
     parser.add_argument(
         "--offload_model",
         type=str2bool,
@@ -246,7 +262,10 @@ def generate(args):
         logging.info("Creating flow inference pipeline.")
         pipeline = FlowInferencePipeline(
             config=cfg,
-            checkpoint_dir=args.ckpt_dir,
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_step=args.checkpoint_step,
+            t5_checkpoint_dir=args.t5_checkpoint_dir,
+            vae_checkpoint_dir=args.vae_checkpoint_dir,
             device_id=device,
             rank=rank,
             t5_cpu=args.t5_cpu,

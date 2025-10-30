@@ -496,7 +496,8 @@ class SafeTensorsStateSource(StateSource):
         from safetensors import safe_open
 
         key_map = {}
-        safetensor_files = file_glob(str(self.path / "*.safetensors"))
+        # DEBUGGING
+        safetensor_files = file_glob(str(self.path / "transformer" / "*.safetensors"))
         for file_path in safetensor_files:
             filename = os.path.basename(file_path)
             try:
@@ -564,7 +565,8 @@ class SafeTensorsStateSource(StateSource):
             all_keys.update(key_to_filename_map.keys())
 
         if not all_keys:
-            safetensor_files = file_glob(str(self.path / "*.safetensors"))
+            # DEBUGGING
+            safetensor_files = file_glob(str(self.path / "transformer" / "*.safetensors"))
             if not safetensor_files and not key_to_filename_map:
                 raise FileNotFoundError(f"No .safetensors files or index found in {self.model_name_or_path}")
             for safetensor_file in safetensor_files:
@@ -603,7 +605,8 @@ class SafeTensorsStateSource(StateSource):
                                 remaining_keys.discard(key)
 
         if remaining_keys:
-            safetensor_files = file_glob(str(self.path / "*.safetensors"))
+            # DEBUGGING
+            safetensor_files = file_glob(str(self.path / "transformer" / "*.safetensors"))
             if not safetensor_files and not key_to_filename_map and not loaded_tensors:
                 raise FileNotFoundError(
                     f"No .safetensors files found in {self.model_name_or_path} to load keys: {remaining_keys}"
@@ -650,7 +653,8 @@ class SafeTensorsStateSource(StateSource):
             return False
 
         # If no index map, scan the files directly.
-        safetensor_files = file_glob(str(self.path / "*.safetensors"))
+        # DEBUGGING
+        safetensor_files = file_glob(str(self.path / "transformer" / "*.safetensors"))
         if not safetensor_files:
             return False
 

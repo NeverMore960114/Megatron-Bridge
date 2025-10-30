@@ -60,49 +60,19 @@ class WanBridge(MegatronModelBridge):
             ffn_hidden_size=hf_config.ffn_dim,
             num_attention_heads=hf_config.num_attention_heads,
             activation_func=openai_gelu,
-            add_qkv_bias=True,
             in_channels=hf_config.in_channels,
             out_channels=hf_config.out_channels,
             text_dim=hf_config.text_dim,
             patch_spatial=hf_config.patch_size[1],
             patch_temporal=hf_config.patch_size[0],
-            patch_size=hf_config.patch_size, # ??? adundant variable
-            rotary_interleaved=True,
             layernorm_epsilon=hf_config.eps,
             hidden_dropout=0,
             attention_dropout=0,
             use_cpu_initialization=True,
             freq_dim=hf_config.freq_dim,
-            qk_layernorm_per_head=False,
             bf16=False,
             params_dtype=torch.float32,
         )
-
-            # num_layers=source_config.num_layers,  # dummy setting
-            # hidden_size=source_config.num_attention_heads * source_config.attention_head_dim,
-            # crossattn_emb_size=source_config.num_attention_heads * source_config.attention_head_dim,
-            # ffn_hidden_size=source_config.ffn_dim,
-            # num_attention_heads=source_config.num_attention_heads,
-            # activation_func=openai_gelu,
-            # add_qkv_bias=True,
-            # in_channels=source_config.in_channels,
-            # text_dim=source_config.text_dim, 
-            # # model_channels=256,
-            # # DEBUGGING
-            # patch_spatial=source_config.patch_size[1],
-            # patch_temporal=source_config.patch_size[0],
-            # patch_size=source_config.patch_size,
-            # rotary_interleaved=True,
-            # layernorm_epsilon=1e-06,
-            # hidden_dropout=0,
-            # attention_dropout=0,
-            # use_cpu_initialization=True,
-            # # DEBUGGING
-            # freq_dim=source_config.freq_dim,
-            # bf16=False,
-            # params_dtype=torch.float32,
-            # # DEBUGGING
-            # qk_layernorm_per_head=False,
 
         return provider
 

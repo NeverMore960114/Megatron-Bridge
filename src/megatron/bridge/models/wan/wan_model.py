@@ -39,7 +39,7 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position
 
     # calculation
     sinusoid = torch.outer(
@@ -70,10 +70,8 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
-            e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-            x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
 
@@ -122,6 +120,8 @@ class WanModel(VisionModule):
         self.patch_temporal = self.config.patch_temporal
         self.patch_size = (self.patch_temporal, self.patch_spatial, self.patch_spatial)
 
+        # these attributes are unused for images/videos, we just set because bridge training requires for LLMs
+        self.share_embeddings_and_output_weights = False
 
         ######################################
         ########## Wan architecture ##########
@@ -189,7 +189,8 @@ class WanModel(VisionModule):
             seq_len, batch_size, _ = x.shape
             c = self.out_channels
             pF, pH, pW = self.patch_size
-            x = x.reshape(seq_len * batch_size, c, pF, pH, pW) # output: x.shape [s * b, c, pF, pH, pW]
+            x = x.reshape(seq_len * batch_size, pF, pH, pW, c) # output: x.shape [s * b, pF, pH, pW, c]
+            x = x.permute(0, 4, 1, 2, 3) # output: x.shape [s * b, c, pF, pH, pW]
             x = self.patch_embedding(x) # output: x.shape [s * b, hidden_size, 1, 1, 1]
             x = x.flatten(1) # output: x.shape [s * b, hidden_size]
             x = x.reshape(seq_len, batch_size, -1) # output: x.shape [s, b, hidden_size]
@@ -204,11 +205,10 @@ class WanModel(VisionModule):
             x = self.decoder.input_tensor
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
-            e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
-            e0 = self.time_projection(e).unflatten(1, (6, self.config.hidden_size))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).to(x.dtype)
+        )
+        e0 = self.time_projection(e).unflatten(1, (6, self.config.hidden_size))
 
         # context embeddings
         context = self.text_embedding(context) # shape [text_len, b, hidden_size]
