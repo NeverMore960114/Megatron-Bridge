@@ -22,6 +22,7 @@ EXP_NAME=...
 PRETRAINED_CHECKPOINT=/path/to/pretrained_checkpoint
 CHECKPOINT_DIR=/path/to/checkpoint_dir
 DATASET_PATH=/path/to/dataset
+cd $MBRIDGE_PATH
 NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=4 examples/recipes/wan/pretrain_wan.py \
   model.tensor_model_parallel_size=1 \
   model.pipeline_model_parallel_size=1 \
@@ -58,6 +59,7 @@ export HF_TOKEN=...
 CHECKPOINT_DIR=/path/to/checkpoint_dir
 T5_DIR=/path/to/t5_weights
 VAE_DIR=/path/to/vae_weights
+cd $MBRIDGE_PATH
 NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 examples/recipes/wan/inference_wan.py \
   --task t2v-1.3B \
   --sizes 832*480 \
