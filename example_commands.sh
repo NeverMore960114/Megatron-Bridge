@@ -23,7 +23,7 @@ PRETRAINED_CHECKPOINT=/path/to/pretrained_checkpoint
 CHECKPOINT_DIR=/path/to/checkpoint_dir
 DATASET_PATH=/path/to/dataset
 cd $MBRIDGE_PATH
-NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=4 examples/recipes/wan/pretrain_wan.py \
+NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=8 examples/recipes/wan/pretrain_wan.py \
   model.tensor_model_parallel_size=1 \
   model.pipeline_model_parallel_size=1 \
   model.context_parallel_size=4 \
