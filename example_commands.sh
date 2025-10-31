@@ -4,7 +4,7 @@ export PYTHONPATH="${MBRIDGE_PATH}/.:${MBRIDGE_PATH}/src/.:/opt/NeMo-Framework-L
 
 
 ### install dependencies
-pip install --upgrade git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0rc7
+pip install --upgrade git+https://github.com/NVIDIA/Megatron-LM.git@ce8185cbbe04f38beb74360e878450f2e8525885
 python3 -m pip install --upgrade diffusers
 pip install easydict
 pip install imageio
