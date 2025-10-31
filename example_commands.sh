@@ -1,8 +1,15 @@
+### set path to Megatron-Bridge
+export MBRIDGE_PATH=/path/to/Megatron-Bridge
+export PYTHONPATH="${MBRIDGE_PATH}/.:${MBRIDGE_PATH}/src/.:/opt/NeMo-Framework-Launcher/launcher_scripts"
+
+
 ### install dependencies
+pip install --upgrade git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0rc7
 python3 -m pip install --upgrade diffusers
 pip install easydict
 pip install imageio
 pip install imageio-ffmpeg
+
 
 ### Convert checkpoint
 See examples/conversion/convert_wan_checkpoints.py for details.
