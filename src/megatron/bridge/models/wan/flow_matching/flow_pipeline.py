@@ -20,7 +20,7 @@ from megatron.core import parallel_state
 from torch import Tensor
 from diffusers import WanPipeline
 from megatron.bridge.models.wan.flow_matching.time_shift_utils import compute_density_for_timestep_sampling
-from megatron.bridge.models.wan.utils.utils import patchify, split_inputs_cp
+from megatron.bridge.models.wan.utils.utils import patchify, thd_split_inputs_cp
 
 class FlowPipeline:
 
@@ -116,6 +116,14 @@ class FlowPipeline:
         # Generate noise
         noise = torch.randn_like(torch.ones([1, 16, grid_sizes[0][0], grid_sizes[0][1]*2, grid_sizes[0][2]*2], device=video_latents.device), dtype=torch.float32)
         noise = patchify(noise, (1, 2, 2))[0].unsqueeze(1)
+        # DEBUGGING
+        # because video_latents might be padded, we need to make sure noise also be padded to have the same shape
+        seq_noise = noise.shape[0]
+        seq_video = video_latents.shape[0]
+        if seq_noise < seq_video:
+            pad_len = seq_video - seq_noise
+            pad = torch.zeros((pad_len, noise.shape[1], noise.shape[2]), device=noise.device, dtype=noise.dtype)
+            noise = torch.cat([noise, pad], dim=0)
 
         # CRITICAL: Manual flow matching (NOT scheduler.add_noise!)
         # x_t = (1 - σ) * x_0 + σ * ε
@@ -140,13 +148,13 @@ class FlowPipeline:
         # ========================================================================
         # Split accross context parallelism
         # ========================================================================
-        
+
         if parallel_state.get_context_parallel_world_size() > 1:
-            video_latents = split_inputs_cp(video_latents, 0)
-            noisy_latents = split_inputs_cp(noisy_latents, 0)
-            noise = split_inputs_cp(noise, 0)
-            context_embeddings = split_inputs_cp(context_embeddings, 0)
-            split_loss_mask = split_inputs_cp(loss_mask, 0)
+            video_latents = thd_split_inputs_cp(video_latents, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+            noisy_latents = thd_split_inputs_cp(noisy_latents, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+            noise = thd_split_inputs_cp(noise, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+            context_embeddings = thd_split_inputs_cp(context_embeddings, packed_seq_params['cross_attention'].cu_seqlens_kv, parallel_state.get_context_parallel_group())
+            split_loss_mask = thd_split_inputs_cp(loss_mask, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
         else:
             video_latents = video_latents
             noisy_latents = noisy_latents
