@@ -15,8 +15,8 @@
 from functools import partial
 
 import torch
-from megatron.bridge.models.wan.wan_model import WanModel
-from diffusers import WanTransformer3DModel
+from megatron.bridge.models.wan.wan_model import WanModel, VACEModel
+from diffusers import WanTransformer3DModel, WanVACETransformer3DModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -27,8 +27,8 @@ from megatron.bridge.models.conversion.param_mapping import (
     KVMapping,
     ReplicatedMapping,
 )
-from megatron.bridge.models.hf_pretrained.wan import PreTrainedWAN
-from megatron.bridge.models.wan.wan_provider import WanModelProvider
+from megatron.bridge.models.hf_pretrained.wan import PreTrainedWAN, PreTrainedVACE
+from megatron.bridge.models.wan.wan_provider import WanModelProvider, VACEModelProvider
 from megatron.core.transformer.utils import openai_gelu
 from megatron.bridge.models.conversion.utils import get_module_and_param_from_name
 
@@ -188,6 +188,222 @@ class WanBridge(MegatronModelBridge):
                     k="blocks.*.attn2.to_k.bias",
                     v="blocks.*.attn2.to_v.bias",
                     megatron_param="decoder.layers.*.cross_attention.linear_kv.bias",
+                ),
+            ]
+        )
+
+        return MegatronMappingRegistry(*mapping_list)
+    
+    
+@MegatronModelBridge.register_bridge(source=WanVACETransformer3DModel, target=VACEModel)
+class VACEBridge(MegatronModelBridge):
+    """
+    Megatron Bridge for VACE model.
+
+    As a user you would not use this bridge directly, but through `AutoBridge`.
+
+    Example:
+        >>> from megatron.bridge import AutoBridge
+        >>> bridge = AutoBridge.from_hf_pretrained("WAN-3D-1.3B-v1")
+        >>> provider = bridge.to_megatron_provider()
+    """
+
+    def provider_bridge(self, hf_pretrained: PreTrainedVACE) -> VACEModelProvider:
+        hf_config = hf_pretrained.config
+
+        cls = VACEModelProvider
+
+        provider = cls(
+            num_layers=hf_config.num_layers,
+            hidden_size=hf_config.num_attention_heads * hf_config.attention_head_dim,
+            kv_channels=hf_config.attention_head_dim,
+            num_query_groups=hf_config.num_attention_heads,
+            crossattn_emb_size=hf_config.num_attention_heads * hf_config.attention_head_dim,
+            ffn_hidden_size=hf_config.ffn_dim,
+            num_attention_heads=hf_config.num_attention_heads,
+            activation_func=openai_gelu,
+            in_channels=hf_config.in_channels,
+            out_channels=hf_config.out_channels,
+            text_dim=hf_config.text_dim,
+            patch_spatial=hf_config.patch_size[1],
+            patch_temporal=hf_config.patch_size[0],
+            layernorm_epsilon=hf_config.eps,
+            hidden_dropout=0,
+            attention_dropout=0,
+            use_cpu_initialization=True,
+            freq_dim=hf_config.freq_dim,
+            bf16=False,
+            params_dtype=torch.float32,
+            vace_in_channels=hf_config.vace_in_channels,
+            vace_layers=hf_config.vace_layers,
+            base_num_layers=hf_config.num_layers,
+        )
+
+        return provider
+
+
+    def mapping_registry(self) -> MegatronMappingRegistry:
+        """Return MegatronMappingRegistry containing parameter mappings from HF to Megatron format.
+
+        Returns:
+            MegatronMappingRegistry: Registry of parameter mappings
+        """
+        # Dictionary maps HF parameter names -> Megatron parameter names
+        # Supports wildcard (*) patterns for layer-specific parameters
+        param_mappings = {
+            "scale_shift_table": "head.modulation",
+            "patch_embedding.weight": "patch_embedding.weight",
+            "patch_embedding.bias": "patch_embedding.bias",
+            "condition_embedder.time_embedder.linear_1.weight": "time_embedding.0.weight",
+            "condition_embedder.time_embedder.linear_1.bias": "time_embedding.0.bias",
+            "condition_embedder.time_embedder.linear_2.weight": "time_embedding.2.weight",
+            "condition_embedder.time_embedder.linear_2.bias": "time_embedding.2.bias",
+            "condition_embedder.time_proj.weight": "time_projection.1.weight",
+            "condition_embedder.time_proj.bias": "time_projection.1.bias",
+            "condition_embedder.text_embedder.linear_1.weight": "text_embedding.0.weight",
+            "condition_embedder.text_embedder.linear_1.bias": "text_embedding.0.bias",
+            "condition_embedder.text_embedder.linear_2.weight": "text_embedding.2.weight",
+            "condition_embedder.text_embedder.linear_2.bias": "text_embedding.2.bias",
+            "blocks.*.scale_shift_table": "decoder.layers.*.adaLN.modulation",
+            "blocks.*.attn1.to_out.0.weight": "decoder.layers.*.full_self_attention.linear_proj.weight",
+            "blocks.*.attn1.to_out.0.bias": "decoder.layers.*.full_self_attention.linear_proj.bias",
+            "blocks.*.attn1.norm_q.weight": "decoder.layers.*.full_self_attention.q_layernorm.weight",
+            "blocks.*.attn1.norm_k.weight": "decoder.layers.*.full_self_attention.k_layernorm.weight",
+            "blocks.*.attn2.to_q.weight": "decoder.layers.*.cross_attention.linear_q.weight",
+            "blocks.*.attn2.to_q.bias": "decoder.layers.*.cross_attention.linear_q.bias",
+            "blocks.*.attn2.to_out.0.weight": "decoder.layers.*.cross_attention.linear_proj.weight",
+            "blocks.*.attn2.to_out.0.bias": "decoder.layers.*.cross_attention.linear_proj.bias",
+            "blocks.*.attn2.norm_q.weight": "decoder.layers.*.cross_attention.q_layernorm.weight",
+            "blocks.*.attn2.norm_k.weight": "decoder.layers.*.cross_attention.k_layernorm.weight",
+            "blocks.*.norm2.weight": "decoder.layers.*.norm3.weight",
+            "blocks.*.norm2.bias": "decoder.layers.*.norm3.bias",
+            "blocks.*.ffn.net.0.proj.weight": "decoder.layers.*.mlp.linear_fc1.weight",
+            "blocks.*.ffn.net.0.proj.bias": "decoder.layers.*.mlp.linear_fc1.bias",
+            "blocks.*.ffn.net.2.weight": "decoder.layers.*.mlp.linear_fc2.weight",
+            "blocks.*.ffn.net.2.bias": "decoder.layers.*.mlp.linear_fc2.bias",
+            "proj_out.weight": "head.head.weight",
+            "proj_out.bias": "head.head.bias",
+            
+            "vace_patch_embedding.weight": "vace_patch_embedding.weight",
+            "vace_patch_embedding.bias": "vace_patch_embedding.bias",
+            "vace_blocks.0.proj_in.weight": "vace_init_proj.weight",
+            "vace_blocks.0.proj_in.bias": "vace_init_proj.bias",
+            "vace_blocks.*.scale_shift_table": "vace_decoder.layers.*.adaLN.modulation",
+            "vace_blocks.*.attn1.to_out.0.weight": "vace_decoder.layers.*.full_self_attention.linear_proj.weight",
+            "vace_blocks.*.attn1.to_out.0.bias": "vace_decoder.layers.*.full_self_attention.linear_proj.bias",
+            "vace_blocks.*.attn1.norm_q.weight": "vace_decoder.layers.*.full_self_attention.q_layernorm.weight",
+            "vace_blocks.*.attn1.norm_k.weight": "vace_decoder.layers.*.full_self_attention.k_layernorm.weight",
+            "vace_blocks.*.attn2.to_q.weight": "vace_decoder.layers.*.cross_attention.linear_q.weight",
+            "vace_blocks.*.attn2.to_q.bias": "vace_decoder.layers.*.cross_attention.linear_q.bias",
+            "vace_blocks.*.attn2.to_out.0.weight": "vace_decoder.layers.*.cross_attention.linear_proj.weight",
+            "vace_blocks.*.attn2.to_out.0.bias": "vace_decoder.layers.*.cross_attention.linear_proj.bias",
+            "vace_blocks.*.attn2.norm_q.weight": "vace_decoder.layers.*.cross_attention.q_layernorm.weight",
+            "vace_blocks.*.attn2.norm_k.weight": "vace_decoder.layers.*.cross_attention.k_layernorm.weight",
+            "vace_blocks.*.norm2.weight": "vace_decoder.layers.*.norm3.weight",
+            "vace_blocks.*.norm2.bias": "vace_decoder.layers.*.norm3.bias",
+            "vace_blocks.*.ffn.net.0.proj.weight": "vace_decoder.layers.*.mlp.linear_fc1.weight",
+            "vace_blocks.*.ffn.net.0.proj.bias": "vace_decoder.layers.*.mlp.linear_fc1.bias",
+            "vace_blocks.*.ffn.net.2.weight": "vace_decoder.layers.*.mlp.linear_fc2.weight",
+            "vace_blocks.*.ffn.net.2.bias": "vace_decoder.layers.*.mlp.linear_fc2.bias",
+            "vace_blocks.*.proj_out.weight":"vace_decoder.layers.*.context_proj.weight",
+            "vace_blocks.*.proj_out.bias":"vace_decoder.layers.*.context_proj.bias",
+        }
+
+
+        # Custom WAN mapping to safely handle replicated params whose owning module
+        # does not expose a top-level `.weight` (e.g., Head.modulation)
+        class _ReplicatedByParamNameMapping(ReplicatedMapping):
+            def hf_to_megatron(self, hf_weights, megatron_module):
+                normalized_param = self._normalize_expert_param_name(self.megatron_param)
+                _, target_param = get_module_and_param_from_name(megatron_module, normalized_param)
+
+                target_device = target_param.device
+                target_dtype = target_param.dtype
+
+                hf_weights = hf_weights.to(device=target_device, dtype=target_dtype)
+                if self.tp_size == 1:
+                    return hf_weights
+
+                if target_device.type == "cuda" and torch.cuda.is_available():
+                    if target_device.index != torch.cuda.current_device():
+                        hf_weights = hf_weights.to(torch.cuda.current_device())
+
+                if self.tp_rank > 0:
+                    hf_weights = torch.empty_like(hf_weights)
+
+                return self.broadcast_tensor_to_tp_ranks(hf_weights, src_rank=0)
+
+
+        mapping_list = []
+        # Convert each dictionary entry to AutoMapping(hf_param, megatron_param)
+        for hf_param, megatron_param in param_mappings.items():
+            if hf_param in {"scale_shift_table", "blocks.*.scale_shift_table", "vace_blocks.*.scale_shift_table", "proj_out.weight", "proj_out.bias"}:
+                # Use WAN-specific replicated mapping that resolves the exact param
+                mapping_list.append(_ReplicatedByParamNameMapping(hf_param=hf_param, megatron_param=megatron_param))
+            else:
+                mapping_list.append(AutoMapping(hf_param=hf_param, megatron_param=megatron_param))
+
+        # Adding custom module types for AutoMapping
+        AutoMapping.register_module_type("Linear", "replicated")
+        AutoMapping.register_module_type("Conv3d", "replicated")
+        AutoMapping.register_module_type("WanAdaLN", "replicated")
+        AutoMapping.register_module_type("Head", "replicated")
+
+        # Add special mappings that require parameter concatenation/transformation
+        mapping_list.extend(
+            [
+                # QKV: Combine separate Q, K, V matrices into single QKV matrix
+                QKVMapping(
+                    q="blocks.*.attn1.to_q.weight",
+                    k="blocks.*.attn1.to_k.weight",
+                    v="blocks.*.attn1.to_v.weight",
+                    megatron_param="decoder.layers.*.full_self_attention.linear_qkv.weight",
+                ),
+                # QKV bias: Combine separate Q, K, V bias into single QKV bias
+                QKVMapping(
+                    q="blocks.*.attn1.to_q.bias",
+                    k="blocks.*.attn1.to_k.bias",
+                    v="blocks.*.attn1.to_v.bias",
+                    megatron_param="decoder.layers.*.full_self_attention.linear_qkv.bias",
+                ),
+                # K, V: Combine separate K, V matrices into single KV matrix
+                KVMapping(
+                    k="blocks.*.attn2.to_k.weight",
+                    v="blocks.*.attn2.to_v.weight",
+                    megatron_param="decoder.layers.*.cross_attention.linear_kv.weight",
+                ),
+                # K, V bias: Combine separate K, V bias into single KV bias
+                KVMapping(
+                    k="blocks.*.attn2.to_k.bias",
+                    v="blocks.*.attn2.to_v.bias",
+                    megatron_param="decoder.layers.*.cross_attention.linear_kv.bias",
+                ),
+                
+                # QKV: Combine separate Q, K, V matrices into single QKV matrix
+                QKVMapping(
+                    q="vace_blocks.*.attn1.to_q.weight",
+                    k="vace_blocks.*.attn1.to_k.weight",
+                    v="vace_blocks.*.attn1.to_v.weight",
+                    megatron_param="vace_decoder.layers.*.full_self_attention.linear_qkv.weight",
+                ),
+                # QKV bias: Combine separate Q, K, V bias into single QKV bias
+                QKVMapping(
+                    q="vace_blocks.*.attn1.to_q.bias",
+                    k="vace_blocks.*.attn1.to_k.bias",
+                    v="vace_blocks.*.attn1.to_v.bias",
+                    megatron_param="vace_decoder.layers.*.full_self_attention.linear_qkv.bias",
+                ),
+                # K, V: Combine separate K, V matrices into single KV matrix
+                KVMapping(
+                    k="vace_blocks.*.attn2.to_k.weight",
+                    v="vace_blocks.*.attn2.to_v.weight",
+                    megatron_param="vace_decoder.layers.*.cross_attention.linear_kv.weight",
+                ),
+                # K, V bias: Combine separate K, V bias into single KV bias
+                KVMapping(
+                    k="vace_blocks.*.attn2.to_k.bias",
+                    v="vace_blocks.*.attn2.to_v.bias",
+                    megatron_param="vace_decoder.layers.*.cross_attention.linear_kv.bias",
                 ),
             ]
         )

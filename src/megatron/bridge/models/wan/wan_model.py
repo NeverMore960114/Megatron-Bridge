@@ -15,6 +15,7 @@
 # pylint: disable=C0115,C0116,C0301
 
 from typing import Dict, Literal, Optional, Tuple, List, Union
+import copy
 
 import math
 import torch
@@ -25,15 +26,117 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_sharded_tensor_for_checkpoint
 from megatron.bridge.models.wan.wan_layer_spec import (
     get_wan_block_with_transformer_engine_spec as WanLayerWithAdaLNspec,
+    get_vace_base_block_with_transformer_engine_spec as VACEBaseLayerspec,
+    get_vace_context_block_with_transformer_engine_spec as VACEContextLayerspec,
 )
 from megatron.bridge.models.wan.wan_layer_spec import WanLayerNorm
 from torch import Tensor
 from .rope_utils import Wan3DRopeEmbeddings
+
+from contextlib import nullcontext
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.utils import get_pg_rank
+
+class IndexTransformerBlock(TransformerBlock):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
+        pg_collection: ProcessGroupCollection = None,
+        vp_stage: Optional[int] = None,
+    ):
+        # Pass block id and context_scale
+        self.vace_layers = [i for i in range(0, config.num_layers, 2)] if config.vace_layers is None else config.vace_layers
+        print(self.vace_layers)
+        assert 0 in self.vace_layers
+        self.vace_layers_mapping = {i: n for n, i in enumerate(self.vace_layers)}
+        
+        super().__init__(
+            config=config, 
+            spec=spec,
+            post_layer_norm=post_layer_norm,
+            pre_process=pre_process,
+            post_process=post_process,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+        )
+    
+    def _build_layers(self):
+        # Transformer layers.
+        # @jcasper can we improve how we deal with layer_number?
+        # currently it's only used in CoreAttention?
+        # if self.apply_query_key_layer_scaling:
+        #     coeff = self.layer_number
+        #     self.norm_factor *= coeff
+        def build_layer(layer_spec, layer_number):
+            global_layer_number = layer_number + get_transformer_layer_offset(
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+            )  # 1-based index
+            if self.config.heterogeneous_block_specs:
+                layer_config = self.config.get_config_for_layer(global_layer_number)
+            else:
+                layer_config = self.config
+
+            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
+            if layer_config.fp8:
+                quantization_context = get_fp8_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            elif layer_config.fp4:
+                quantization_context = get_fp4_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            else:
+                quantization_context = nullcontext()
+
+            with quantization_context:
+                module = build_module(
+                    layer_spec,
+                    config=layer_config,
+                    layer_number=layer_number,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
+                )
+                idx = global_layer_number - 1
+                if idx in self.vace_layers:
+                    module.idx = self.vace_layers_mapping[idx]
+                    module.context_scale = self.config.context_scale
+                else:
+                    module.idx = None
+            return module
+
+        # offset is implicit in TransformerLayer
+        self.layers = torch.nn.ModuleList(
+            [
+                build_layer(layer_spec, i + 1)
+                for i, layer_spec in enumerate(self.submodules.layer_specs)
+            ]
+        )
+
+        # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
+        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+        # self.post_process and self.post_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.final_layernorm = None  # Either this or nn.Identity
 
 def sinusoidal_embedding_1d(dim, position):
     # preprocess
@@ -168,7 +271,7 @@ class WanModel(VisionModule):
         """Forward pass.
 
         Args:
-            x List[Tensor]: list of vae encoded data (in_channel, f, h, w)
+            x List[Tensor]: list of vae encoded data (s, b, c * pF * pH * pW)
             grid_sizes List[Tuple[int, int, int]]: list of grid sizes (f, h, w)
             t Tensor: timesteps
             context List[Tensor]: list of context (text_len, hidden_size)
@@ -187,7 +290,7 @@ class WanModel(VisionModule):
         if self.pre_process:
             # x.shape [s, b, c * pF * pH * pW]
             seq_len, batch_size, _ = x.shape
-            c = self.out_channels
+            c = self.in_channels
             pF, pH, pW = self.patch_size
             x = x.reshape(seq_len * batch_size, pF, pH, pW, c) # output: x.shape [s * b, pF, pH, pW, c]
             x = x.permute(0, 4, 1, 2, 3) # output: x.shape [s * b, c, pF, pH, pW]
@@ -268,7 +371,7 @@ class WanModel(VisionModule):
 
 
     def sharded_state_dict(
-        self, prefix: str = "module.", sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
         """Sharded state dict implementation for GPTModel backward-compatibility (removing extra state).
 
@@ -330,3 +433,178 @@ class WanModel(VisionModule):
             replica_id=replica_id,
             allow_shape_mismatch=False,
         )
+
+
+class VACEModel(WanModel):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pre_process: bool = True,
+        post_process: bool = True,
+        fp16_lm_cross_entropy: bool = False,
+        parallel_output: bool = True,
+        transformer_decoder_layer_spec=VACEBaseLayerspec,
+        vace_transformer_decoder_layer_spec=VACEContextLayerspec,
+        **kwargs,
+    ):
+        super().__init__(
+            config,
+            pre_process,
+            post_process,
+            fp16_lm_cross_entropy,
+            parallel_output,
+            transformer_decoder_layer_spec,
+            **kwargs
+        )
+        
+        self.vace_in_channels = self.config.vace_in_channels
+        self.vace_transformer_decoder_layer_spec = vace_transformer_decoder_layer_spec()
+        
+        if self.pre_process:
+            self.vace_patch_embedding = nn.Conv3d(
+                self.vace_in_channels, self.config.hidden_size, kernel_size=self.patch_size, stride=self.patch_size)
+            
+        self.decoder = IndexTransformerBlock(
+            config=self.config,
+            spec=self.transformer_decoder_layer_spec,
+            pre_process=self.pre_process,
+            post_process=self.post_process,
+            post_layer_norm=False,
+        )
+        # print(self.decoder)
+        self.vace_config = copy.deepcopy(self.config)
+        self.vace_config.num_layers = len(self.decoder.vace_layers)
+        self.vace_decoder = TransformerBlock(
+            config=self.vace_config,
+            spec=self.vace_transformer_decoder_layer_spec,
+            pre_process=self.pre_process,
+            post_process=self.post_process,
+            post_layer_norm=False,
+        )
+        # print(self.vace_decoder.state_dict().keys())
+        
+        self.vace_init_proj = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        
+    
+    def forward(
+        self,
+        x: Tensor,
+        grid_sizes: list[Tuple[int, int, int]],
+        t: Tensor,
+        context: Tensor,
+        vace_context: Tensor,
+        max_seq_len: int,
+        packed_seq_params: PackedSeqParams = None,
+        **kwargs,
+    ) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x List[Tensor]: list of vae encoded data (s, b, c * pF * pH * pW)
+            grid_sizes List[Tuple[int, int, int]]: list of grid sizes (f, h, w)
+            t Tensor: timesteps
+            context List[Tensor]: list of context (text_len, hidden_size)
+            max_seq_len int: maximum sequence length
+            packed_seq_params PackedSeqParams: packed sequence parameters
+
+        Returns:
+            Tensor: output tensor (still patchified) of shape [seq_len, batch_size, hidden_size]
+        """
+        #################################
+        ########## Wan forward ##########
+
+        # ============= embedders =============
+
+        # run input embedding
+        if self.pre_process:
+            # x.shape [s, b, c * pF * pH * pW]
+            seq_len, batch_size, _ = x.shape
+            c = self.in_channels
+            pF, pH, pW = self.patch_size
+            x = x.reshape(seq_len * batch_size, pF, pH, pW, c) # output: x.shape [s * b, pF, pH, pW, c]
+            x = x.permute(0, 4, 1, 2, 3) # output: x.shape [s * b, c, pF, pH, pW]
+            x = self.patch_embedding(x) # output: x.shape [s * b, hidden_size, 1, 1, 1]
+            x = x.flatten(1) # output: x.shape [s * b, hidden_size]
+            x = x.reshape(seq_len, batch_size, -1) # output: x.shape [s, b, hidden_size]
+            
+            # vace_context.shape [s, b, c * pF * pH * pW]
+            vace_seq_len, _, _ = vace_context.shape
+            vace_c = self.vace_in_channels
+            # pF, pH, pW = self.patch_size
+            vace_context = vace_context.reshape(vace_seq_len * batch_size, pF, pH, pW, vace_c) # output: vace_context.shape [s * b, pF, pH, pW, c]
+            vace_context = vace_context.permute(0, 4, 1, 2, 3) # output: vace_context.shape [s * b, c, pF, pH, pW]
+            vace_context = self.vace_patch_embedding(vace_context) # output: vace_context.shape [s * b, hidden_size, 1, 1, 1]
+            vace_context = vace_context.flatten(1) # output: vace_context.shape [s * b, hidden_size]
+            vace_context = vace_context.reshape(vace_seq_len, batch_size, -1) # output: vace_context.shape [s, b, hidden_size]
+            vace_context = self.vace_init_proj(vace_context) + x
+            vace_context = vace_context.unsqueeze(0)
+            
+            # split sequence for sequence_parallel
+            # TODO: for PP, do we move scatter_to_sequence_parallel_region here or after "x = self.decoder.input_tensor" ???
+            if self.config.sequence_parallel:
+                x = tensor_parallel.scatter_to_sequence_parallel_region(x) # output: x.shape [s * b // tp_size, hidden_size]
+                vace_context = tensor_parallel.scatter_to_sequence_parallel_region(vace_context) # output: vace_context.shape [s * b // tp_size, hidden_size]
+
+        else:
+            # intermediate stage of pipeline
+            x = self.decoder.input_tensor
+            vace_context = self.vace_decoder.input_tensor
+            
+        # run context token embedding
+        
+        # time embeddings
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).to(x.dtype)
+        )
+        e0 = self.time_projection(e).unflatten(1, (6, self.config.hidden_size))
+
+        # context embeddings
+        context = self.text_embedding(context) # shape [text_len, b, hidden_size]
+
+
+        # ============= decoder =============
+        # calculate rotary pos emb
+        n_head, dim_head = self.num_heads, self.config.hidden_size // self.num_heads
+        rotary_pos_emb = self.rope_embeddings(n_head, dim_head, max_seq_len, grid_sizes, t.device) # output: rotary_pos_emb.shape [s, b, 1, dim_head]
+
+        # run vace decoder
+        vace_context = self.vace_decoder(
+            hidden_states=vace_context,
+            attention_mask=e0,
+            context=context,
+            context_mask=None,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            packed_seq_params=packed_seq_params,
+        )[:-1]
+        
+        # run decoder
+        x = self.decoder(
+            hidden_states=x,
+            attention_mask=e0,
+            context=context,
+            context_mask=vace_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            packed_seq_params=packed_seq_params,
+        )
+
+        # return if not post_process
+        if not self.post_process:
+            return x
+
+        # head
+        x = x.transpose(0, 1) # head expects shape [b, s, hidden_size]
+        x = self.head(x, e) # output: x.shape [b, s, c * pF * pH * pW]
+        x = x.transpose(0, 1) # reshape back to shape [s, b, c * pF * pH * pW]
+
+        # gather outputs for sequence_parallel
+        # Note: in GPT models, because the vocab projection matrix is ColumnParallelLinear, the sequence is 
+        #   automatically gathered in ColumnParallelLinear forward pass.
+        #   However, in Wan models, we need to gather the outputs manually.
+        if self.config.sequence_parallel:
+            x = tensor_parallel.gather_from_sequence_parallel_region(x)
+
+        return x # output: x.shape [s, b, c * pF * pH * pW]

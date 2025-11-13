@@ -368,6 +368,12 @@ class WanWithAdaLNSubmodules(TransformerLayerSubmodules):
     norm1: Union[ModuleSpec, type] = None
     norm3: Union[ModuleSpec, type] = None
     norm2: Union[ModuleSpec, type] = None
+    context_proj: Union[ModuleSpec, type] = IdentityOp
+    
+    
+# @dataclass
+# class VACEContextLayerSubmodules(WanWithAdaLNSubmodules):
+    
 
 
 class WanAdaLN(MegatronModule):
@@ -416,7 +422,7 @@ class WanLayerWithAdaLN(TransformerLayer):
         vp_stage: Optional[int] = None,
     ):
         super().__init__(
-            config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout
+            config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout, pg_collection=pg_collection, vp_stage=vp_stage
         )
 
         # # TODO: Override Cross Attention to disable TP Comm overlap as well. ???
@@ -545,6 +551,143 @@ class WanLayerWithAdaLN(TransformerLayer):
         return output, context
 
 
+class VACEBaseLayer(WanLayerWithAdaLN):
+    """A single transformer layer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+
+    DiT with Adapative Layer Normalization.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: float = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ):
+        super().__init__(
+            config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout, pg_collection=pg_collection, vp_stage=vp_stage
+        )
+
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        attention_bias=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        inference_context=None,
+    ):
+        
+        hidden_states, context = super().forward(
+            hidden_states, 
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=None,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_context=inference_context,
+        )
+        # consider how to pass block id and context_scale
+        # the context_tokens from context branch is stored in context_mask argument
+        if self.idx:
+            hidden_states = hidden_states + context_mask[self.idx] * self.context_scale
+
+        return hidden_states, context
+   
+    
+class VACEContextLayer(WanLayerWithAdaLN):
+    """A single transformer layer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+
+    DiT with Adapative Layer Normalization.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: float = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ):
+        super().__init__(
+            config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout, pg_collection=pg_collection, vp_stage=vp_stage
+        )
+
+        self.context_proj = build_module(
+            submodules.context_proj,
+            self.config.hidden_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
+            tp_group=self.pg_collection.tp,
+        )
+
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        context=None,
+        context_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        attention_bias=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        inference_context=None,
+    ):  
+        
+        all_hidden_states = list(torch.unbind(hidden_states))
+        hidden_states = all_hidden_states.pop(-1)
+        hidden_states, context = super().forward(
+            hidden_states, 
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=None,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_context=inference_context,
+        )
+        hidden_states_proj, bias = self.context_proj(hidden_states)
+        all_hidden_states += [hidden_states_proj + bias, hidden_states]
+        hidden_states = torch.stack(all_hidden_states)
+
+        return hidden_states, context
+
+
 import transformer_engine as te
 def get_wan_block_with_transformer_engine_spec() -> ModuleSpec:
     params = {"attn_mask_type": AttnMaskType.padding}
@@ -589,3 +732,95 @@ def get_wan_block_with_transformer_engine_spec() -> ModuleSpec:
             ),
         ),
     )
+    
+    
+def get_vace_base_block_with_transformer_engine_spec() -> ModuleSpec:
+    params = {"attn_mask_type": AttnMaskType.padding}
+    return ModuleSpec(
+        module=VACEBaseLayer,
+        submodules=WanWithAdaLNSubmodules(
+            norm1=WanLayerNorm,
+            norm3=WanLayerNorm,
+            norm2=WanLayerNorm,
+            full_self_attention=ModuleSpec(
+                module=WanSelfAttention,
+                params=params,
+                submodules=WanSelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,     
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,         
+                ),
+            ),
+            cross_attention=ModuleSpec(
+                module=WanCrossAttention,
+                params=params,
+                submodules=WanCrossAttentionSubmodules(
+                    linear_q=TEColumnParallelLinear,
+                    linear_kv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,
+                ),
+            ),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear,
+                    # by default, activation_func is openai_gelu, which is equivalent to nn.GELU(approximate='tanh')
+                    linear_fc2=TERowParallelLinear,
+                ),
+            ),
+        ),
+    )
+    
+    
+def get_vace_context_block_with_transformer_engine_spec() -> ModuleSpec:
+    params = {"attn_mask_type": AttnMaskType.padding}
+    return ModuleSpec(
+        module=VACEContextLayer,
+        submodules=WanWithAdaLNSubmodules(
+            norm1=WanLayerNorm,
+            norm3=WanLayerNorm,
+            norm2=WanLayerNorm,
+            full_self_attention=ModuleSpec(
+                module=WanSelfAttention,
+                params=params,
+                submodules=WanSelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,     
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,         
+                ),
+            ),
+            cross_attention=ModuleSpec(
+                module=WanCrossAttention,
+                params=params,
+                submodules=WanCrossAttentionSubmodules(
+                    linear_q=TEColumnParallelLinear,
+                    linear_kv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    layernorm_across_head=True,
+                    q_layernorm=TENorm,
+                    k_layernorm=TENorm,
+                ),
+            ),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear,
+                    # by default, activation_func is openai_gelu, which is equivalent to nn.GELU(approximate='tanh')
+                    linear_fc2=TERowParallelLinear,
+                ),
+            ),
+            context_proj=TERowParallelLinear
+        ),
+    )
+

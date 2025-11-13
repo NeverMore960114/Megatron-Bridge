@@ -21,7 +21,7 @@ from megatron.bridge.models.transformer_config import TransformerConfig
 
 from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.core.models.common.vision_module.vision_module import VisionModule
-from megatron.bridge.models.wan.wan_model import WanModel
+from megatron.bridge.models.wan.wan_model import WanModel, VACEModel
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,33 @@ class WanModelProvider(TransformerConfig, ModelProviderMixin[VisionModule]):
             )
 
         model = WanModel
+
+        return model(
+            self,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            fp16_lm_cross_entropy=self.fp16_lm_cross_entropy,
+            parallel_output=self.parallel_output,
+        )
+        
+        
+@dataclass
+class VACEModelProvider(WanModelProvider):
+    vace_layers: list = None
+    # vace_layers: list = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+    vace_in_channels: int = 96
+    base_num_layers: int = 30
+    context_scale: float = 1.0
+
+    def provide(self, pre_process=None, post_process=None, vp_stage=None) -> VACEModel:
+        vp_size = self.virtual_pipeline_model_parallel_size
+        if vp_size:
+            p_size = self.pipeline_model_parallel_size
+            assert (self.num_layers // p_size) % vp_size == 0, (
+                "Make sure the number of model chunks is the same across all pipeline stages."
+            )
+
+        model = VACEModel
 
         return model(
             self,

@@ -15,7 +15,7 @@
 from pathlib import Path
 from typing import Optional, Union
 
-from diffusers import WanTransformer3DModel
+from diffusers import WanTransformer3DModel, WanVACETransformer3DModel
 from transformers import AutoConfig
 
 from megatron.bridge.models.hf_pretrained.base import PreTrainedBase
@@ -39,7 +39,7 @@ class PreTrainedWAN(PreTrainedBase):
 
     # Model loading is optional for conversion; implemented for completeness
     def _load_model(self) -> WanTransformer3DModel:
-        return WanTransformer3DModel.from_pretrained(self.model_name_or_path)
+        return WanTransformer3DModel.from_pretrained(self.model_name_or_path, subfolder="transformer")
 
     # Config is required by the WAN bridge
     def _load_config(self) -> AutoConfig:
@@ -48,5 +48,34 @@ class PreTrainedWAN(PreTrainedBase):
         print(f"Loading config from {self.model_name_or_path}")
         
         return WanTransformer3DModel.from_pretrained(self.model_name_or_path, subfolder="transformer").config
+    
+    
+class PreTrainedVACE(PreTrainedBase):
+    """
+    Lightweight pretrained wrapper for Diffusers WAN models.
+
+    Provides access to WAN config and state through the common PreTrainedBase API
+    so bridges can consume `.config` and `.state` uniformly.
+    """
+
+    def __init__(self, model_name_or_path: Union[str, Path], **kwargs):
+        self._model_name_or_path = str(model_name_or_path)
+        super().__init__(**kwargs)
+
+    @property
+    def model_name_or_path(self) -> str:
+        return self._model_name_or_path
+
+    # Model loading is optional for conversion; implemented for completeness
+    def _load_model(self) -> WanVACETransformer3DModel:
+        return WanVACETransformer3DModel.from_pretrained(self.model_name_or_path, subfolder="transformer")
+
+    # Config is required by the WAN bridge
+    def _load_config(self) -> AutoConfig:
+        # WanTransformer3DModel returns a config-like object with required fields
+
+        print(f"Loading config from {self.model_name_or_path}")
+        
+        return WanVACETransformer3DModel.from_pretrained(self.model_name_or_path, subfolder="transformer").config
 
 
