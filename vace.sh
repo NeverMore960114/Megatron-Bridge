@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1
 
 ### Inferencing
 # Download T5 weights and VAE weights from "https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/main"
@@ -6,21 +6,21 @@ export CUDA_VISIBLE_DEVICES=0
 #   VAE: Wan2.1_VAE.pth
 
 CHECKPOINT_DIR=/opt/megatron_checkpoint_VACE
-T5_DIR=~/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a
-VAE_DIR=~/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a
+T5_DIR=/opt/Wan2.1-T2V-1.3B
+VAE_DIR=/opt/Wan2.1-T2V-1.3B
 
-NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 examples/recipes/wan/inference_vace.py \
+NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 examples/recipes/wan/inference_vace.py \
   --model_name vace-1.3B \
   --sizes 832*480 \
-  --src_video "test.mp4" \
-  --src_mask "src_mask.mp4" \
+  --save_file "depth" \
+  --src_video "src_video_depth.mp4" \
   --checkpoint_dir ${CHECKPOINT_DIR} \
   --checkpoint_step 0000 \
   --t5_checkpoint_dir ${T5_DIR} \
   --vae_checkpoint_dir ${VAE_DIR} \
   --prompts "Two dogs hit each other during boxing." \
   --frame_nums 81 \
-  --tensor_parallel_size 1 \
+  --tensor_parallel_size 2 \
   --context_parallel_size 1 \
   --pipeline_parallel_size 1 \
   --sequence_parallel False \

@@ -1019,6 +1019,9 @@ class VACEFlowInferencePipeline:
         vace_context0 = self.vace_encode_frames(input_frames, input_ref_images, masks=input_masks)
         mask0 = self.vace_encode_masks(input_masks, input_ref_images)
         vace_context = self.vace_latent(vace_context0, mask0)
+    
+        # # for huggingface inference, latent shape: B, C_latent, N/4, H/8, W/8
+        # vace_context_hf = torch.stack(vace_context)
         
         max_video_seq_len = 0
         seq_lens = []
@@ -1163,6 +1166,11 @@ class VACEFlowInferencePipeline:
             arg_c = {'context': contexts, 'max_seq_len': max_video_seq_len, 'packed_seq_params': packed_seq_params}
             arg_null = {'context': contexts_null, 'max_seq_len': max_video_seq_len, 'packed_seq_params': packed_seq_params}
 
+            
+            from megatron.bridge.models.hf_pretrained.wan import PreTrainedVACE
+            hf = PreTrainedVACE("Wan-AI/Wan2.1-VACE-1.3B-Diffusers")._load_model().to(self.device)
+            
+            
             for _, t in enumerate(tqdm(timesteps)):
 
                 batch_size = len(latents)
@@ -1197,6 +1205,23 @@ class VACEFlowInferencePipeline:
                 # when unpatchifying, the code will truncate the padded videos into the original video shape, based on the grid_sizes.
                 unpatchified_noise_pred_uncond = self.unpatchify(unpatchified_noise_pred_uncond, grid_sizes, self.vae.model.z_dim)
 
+                
+                # # for huggingface inference
+                # unpatchified_latents = torch.stack(latents)
+                # timestep = [t] * batch_size
+                # timestep = torch.stack(timestep)
+                # unpatchified_noise_pred_cond=hf(hidden_states=unpatchified_latents,
+                #                                 timestep=timestep,
+                #                                 encoder_hidden_states=contexts.transpose(0,1),
+                #                                 control_hidden_states=vace_context_hf,
+                #                                 return_dict=False)[0]
+                # unpatchified_noise_pred_uncond=hf(hidden_states=unpatchified_latents,
+                #                                 timestep=timestep,
+                #                                 encoder_hidden_states=contexts_null.transpose(0,1),
+                #                                 control_hidden_states=vace_context_hf,
+                #                                 return_dict=False)[0]
+                
+                
                 noise_preds = []
                 for i in range(batch_size):
                     noise_pred = unpatchified_noise_pred_uncond[i] + guide_scale * (

@@ -606,8 +606,10 @@ class VACEBaseLayer(WanLayerWithAdaLN):
         )
         # consider how to pass block id and context_scale
         # the context_tokens from context branch is stored in context_mask argument
-        if self.idx:
+        if self.idx is not None:
             hidden_states = hidden_states + context_mask[self.idx] * self.context_scale
+            # hidden_states = hidden_states + context_mask[self.idx] * 2.0
+            # hidden_states = hidden_states + torch.rand_like(context_mask[self.idx]) * 0.05
 
         return hidden_states, context
    

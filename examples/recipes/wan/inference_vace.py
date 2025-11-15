@@ -238,22 +238,22 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     if args.prompts is None:
-        prompts = [EXAMPLE_PROMPT[args.model_name]["prompt"]]
+        prompts = [None]
     else:
         prompts = args.prompts
         
     if args.src_video is None:
-        src_video = [EXAMPLE_PROMPT[args.model_name].get("src_video", None)]
+        src_video = [None]
     else:
         src_video = args.src_video
         
     if args.src_mask is None:
-        src_mask = [EXAMPLE_PROMPT[args.model_name].get("src_mask", None)]
+        src_mask = [None]
     else:
         src_mask = args.src_mask
         
     if args.src_ref_images is None:
-        src_ref_images = [EXAMPLE_PROMPT[args.model_name].get("src_ref_images", None)]
+        src_ref_images = [None]
     else:
         src_ref_images = args.src_ref_images
 
@@ -302,8 +302,8 @@ def generate(args):
 
     for i in range(len(src_video)):
         sub_src_video, sub_src_mask, sub_src_ref_images = pipeline.prepare_source([src_video[i]],
-                                                                  [None],
-                                                                  [None],
+                                                                  [src_mask[i]],
+                                                                  [src_ref_images[i]],
                                                                   frame_nums[i], SIZE_CONFIGS[size_keys[i]], device)
         src_video[i], src_mask[i], src_ref_images[i] = *sub_src_video, *sub_src_mask, *sub_src_ref_images
     
@@ -345,31 +345,31 @@ def generate(args):
                 
             cache_video(
                 tensor=src_video[i][None],
-                save_file=f'{i}_src_video.mp4',
+                save_file=f'{args.model_name}_{formatted_experiment_name}_index{i}_src_video_{formatted_time}.mp4',
                 fps=cfg.sample_fps,
                 nrow=1,
                 normalize=True,
                 value_range=(-1, 1))
-            logging.info(f"Saving src_video to {i}_src_video.mp4")
+            logging.info(f"Saving src_video to {args.model_name}_{formatted_experiment_name}_index{i}_src_video_{formatted_time}.mp4")
 
             cache_video(
                 tensor=src_mask[i][None],
-                save_file=f'{i}_src_mask.mp4',
+                save_file=f'{args.model_name}_{formatted_experiment_name}_index{i}_src_mask_{formatted_time}.mp4',
                 fps=cfg.sample_fps,
                 nrow=1,
                 normalize=True,
                 value_range=(0, 1))
-            logging.info(f"Saving src_mask to {i}_src_mask.mp4")
+            logging.info(f"Saving src_mask to {args.model_name}_{formatted_experiment_name}_index{i}_src_mask_{formatted_time}.mp4")
 
             if src_ref_images[i] is not None:
                 for j, ref_img in enumerate(src_ref_images[i]):
                     cache_image(
                         tensor=ref_img[:, 0, ...],
-                        save_file=f'{i}_src_ref_image_{j}.png',
+                        save_file=f'{args.model_name}_{formatted_experiment_name}_index{i}_src_ref_image_{j}_{formatted_time}.png',
                         nrow=1,
                         normalize=True,
                         value_range=(-1, 1))
-                    logging.info(f"Saving src_ref_image_{j} to {i}_src_ref_image_{j}.png")
+                    logging.info(f"Saving src_ref_image_{j} to {args.model_name}_{formatted_experiment_name}_index{i}_src_ref_image_{j}_{formatted_time}.png")
     logging.info("Finished.")
 
 
