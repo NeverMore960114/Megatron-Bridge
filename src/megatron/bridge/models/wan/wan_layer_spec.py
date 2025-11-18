@@ -33,6 +33,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
     TERowParallelLinear,
+    TELinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -439,6 +440,8 @@ class WanLayerWithAdaLN(TransformerLayer):
             submodules.full_self_attention,
             config=self.config,
             layer_number=layer_number,
+            cp_comm_type=config.cp_comm_type,
+            pg_collection=pg_collection,
         )
 
         self.adaLN = WanAdaLN(config=self.config)
@@ -636,18 +639,33 @@ class VACEContextLayer(WanLayerWithAdaLN):
             config=config, submodules=submodules, layer_number=layer_number, hidden_dropout=hidden_dropout, pg_collection=pg_collection, vp_stage=vp_stage
         )
 
+        # self.context_proj = build_module(
+        #     submodules.context_proj,
+        #     self.config.hidden_size,
+        #     self.config.hidden_size,
+        #     config=self.config,
+        #     init_method=self.config.output_layer_init_method,
+        #     bias=self.config.add_bias_linear,
+        #     input_is_parallel=False,
+        #     skip_bias_add=True,
+        #     is_expert=False,
+        #     tp_comm_buffer_name='proj',
+        #     tp_group=self.pg_collection.tp,
+        # )
         self.context_proj = build_module(
             submodules.context_proj,
             self.config.hidden_size,
             self.config.hidden_size,
+            parallel_mode="duplicated",
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
             is_expert=False,
+            symmetric_ar_type=self.config.symmetric_ar_type,
             tp_comm_buffer_name='proj',
-            tp_group=self.pg_collection.tp,
+            tp_group=None,
         )
 
 
@@ -684,7 +702,7 @@ class VACEContextLayer(WanLayerWithAdaLN):
             inference_context=inference_context,
         )
         hidden_states_proj, bias = self.context_proj(hidden_states)
-        all_hidden_states += [hidden_states_proj + bias, hidden_states]
+        all_hidden_states += [hidden_states_proj, hidden_states]
         hidden_states = torch.stack(all_hidden_states)
 
         return hidden_states, context
@@ -822,7 +840,7 @@ def get_vace_context_block_with_transformer_engine_spec() -> ModuleSpec:
                     linear_fc2=TERowParallelLinear,
                 ),
             ),
-            context_proj=TERowParallelLinear
+            context_proj=TELinear
         ),
     )
 

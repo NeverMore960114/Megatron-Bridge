@@ -29,7 +29,7 @@ from megatron.bridge.models.wan.inference.utils.fm_solvers_unipc import FlowUniP
 from megatron.bridge.models.wan.utils.utils import grid_sizes_calculation, patchify
 from megatron.core import parallel_state
 from torch.nn import functional as F
-from megatron.bridge.models.wan.utils.utils import cat_outputs_cp
+from megatron.bridge.models.wan.utils.utils import split_inputs_cp, cat_outputs_cp, thd_split_inputs_cp, thd_cat_outputs_cp
 
 import math
 from typing import Tuple, Union
@@ -470,6 +470,12 @@ class FlowInferencePipeline:
                     qkv_format=self.model.config.qkv_format,
                 ),
             }
+
+            
+            # context parallel
+            if parallel_state.get_context_parallel_world_size() > 1:
+                contexts = thd_split_inputs_cp(contexts, packed_seq_params['cross_attention'].cu_seqlens_kv, parallel_state.get_context_parallel_group())
+                contexts_null = thd_split_inputs_cp(contexts_null, packed_seq_params['cross_attention'].cu_seqlens_kv, parallel_state.get_context_parallel_group())
             
 
             arg_c = {'context': contexts, 'max_seq_len': max_video_seq_len, 'packed_seq_params': packed_seq_params}
@@ -488,6 +494,11 @@ class FlowInferencePipeline:
                 latents = torch.stack(latents, dim=1)
 
 
+                # context parallel
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    latents = thd_split_inputs_cp(latents, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+
+
                 latent_model_input = latents
                 timestep = [t] * batch_size
                 timestep = torch.stack(timestep)
@@ -498,6 +509,13 @@ class FlowInferencePipeline:
 
                 noise_pred_uncond = self.forward_pp_step(
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, arg_c=arg_null)
+
+
+                # context parallel
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    noise_pred_cond = thd_cat_outputs_cp(noise_pred_cond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+                    noise_pred_uncond = thd_cat_outputs_cp(noise_pred_uncond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+
 
                 # run unpatchify
                 unpatchified_noise_pred_cond = noise_pred_cond
@@ -1161,7 +1179,14 @@ class VACEFlowInferencePipeline:
                     qkv_format=self.model.config.qkv_format,
                 ),
             }
-            
+
+
+            # context parallel
+            if parallel_state.get_context_parallel_world_size() > 1:
+                vace_context = thd_split_inputs_cp(vace_context, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+                contexts = thd_split_inputs_cp(contexts, packed_seq_params['cross_attention'].cu_seqlens_kv, parallel_state.get_context_parallel_group())
+                contexts_null = thd_split_inputs_cp(contexts_null, packed_seq_params['cross_attention'].cu_seqlens_kv, parallel_state.get_context_parallel_group())
+
 
             arg_c = {'context': contexts, 'max_seq_len': max_video_seq_len, 'packed_seq_params': packed_seq_params}
             arg_null = {'context': contexts_null, 'max_seq_len': max_video_seq_len, 'packed_seq_params': packed_seq_params}
@@ -1184,6 +1209,11 @@ class VACEFlowInferencePipeline:
                 latents = torch.stack(latents, dim=1)
 
 
+                # context parallel
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    latents = thd_split_inputs_cp(latents, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+
+
                 latent_model_input = latents
                 timestep = [t] * batch_size
                 timestep = torch.stack(timestep)
@@ -1194,6 +1224,13 @@ class VACEFlowInferencePipeline:
 
                 noise_pred_uncond = self.forward_pp_step(
                     latent_model_input, grid_sizes=grid_sizes, max_video_seq_len=max_video_seq_len, timestep=timestep, vace_context=vace_context, arg_c=arg_null)
+
+
+                # context parallel
+                if parallel_state.get_context_parallel_world_size() > 1:
+                    noise_pred_cond = thd_cat_outputs_cp(noise_pred_cond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+                    noise_pred_uncond = thd_cat_outputs_cp(noise_pred_uncond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
+
 
                 # run unpatchify
                 unpatchified_noise_pred_cond = noise_pred_cond

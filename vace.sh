@@ -20,8 +20,8 @@ NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoin
   --vae_checkpoint_dir ${VAE_DIR} \
   --prompts "Two dogs hit each other during boxing." \
   --frame_nums 81 \
-  --tensor_parallel_size 2 \
-  --context_parallel_size 1 \
+  --tensor_parallel_size 1 \
+  --context_parallel_size 2 \
   --pipeline_parallel_size 1 \
   --sequence_parallel False \
   --base_seed 42 \

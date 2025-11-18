@@ -165,3 +165,57 @@ def thd_split_inputs_cp(x: torch.Tensor,
     # Return to [S, B, ...]
     x_local = x_local_bs.transpose(0, 1).contiguous()  # [S_local, B, ...]
     return x_local
+
+
+def thd_cat_outputs_cp(x_local: torch.Tensor,
+                         cu_seqlens_q_padded: torch.Tensor,
+                         cp_group: dist.ProcessGroup) -> torch.Tensor:
+    """
+    Reverse of thd_split_inputs_cp: gather THD-partitioned local shards back to global.
+
+    Args:
+        x_local: [S_local, B, ...] tensor (this rank's shard, sequence first).
+        cu_seqlens_q_padded: 1D int32 THD cu_seqlens (padded) used for packing.
+        cp_group: context-parallel process group.
+
+    Returns:
+        x_global: [S, B, ...] tensor reassembled across CP ranks.
+    """
+    # Work in [B, S_local, ...] for easy indexing along S
+    x_local_bs = x_local.transpose(0, 1).contiguous()  # [B, S_local, ...]
+
+    cp_size = dist.get_world_size(cp_group)
+    cp_rank = dist.get_rank(cp_group)
+
+    # Discover total S from cu_seqlens (last value)
+    # (Matches 'total_S' used during split.)
+    total_S = int(cu_seqlens_q_padded[-1].item())
+
+    # All-gather local shards across CP group
+    gather_list = [torch.empty_like(x_local_bs) for _ in range(cp_size)]
+    dist.all_gather(gather_list, x_local_bs, group=cp_group)  # each is [B, S_r, ...]
+
+    # Compute per-rank indices once (same device/dtype as input)
+    # NOTE: tex.thd_get_partitioned_indices returns indices along S for that rank.
+    idx_list = []
+    for r in range(cp_size):
+        idx_r = tex.thd_get_partitioned_indices(
+            cu_seqlens_q_padded,  # int32 offsets
+            total_S,
+            cp_size,
+            r,
+        ).to(device=x_local_bs.device, dtype=torch.long)  # [S_r]
+        idx_list.append(idx_r)
+
+    # Allocate output [B, S, ...] and place each rank's slice back
+    out_shape = list(x_local_bs.shape)
+    out_shape[1] = total_S  # replace S_local with S
+    x_global_bs = x_local_bs.new_zeros(out_shape)  # [B, S, ...]
+
+    # index_copy_ along S dimension
+    for shard, idx in zip(gather_list, idx_list):
+        x_global_bs.index_copy_(dim=1, index=idx, source=shard)
+
+    # Return to [S, B, ...]
+    x_global = x_global_bs.transpose(0, 1).contiguous()  # [S, B, ...]
+    return x_global
