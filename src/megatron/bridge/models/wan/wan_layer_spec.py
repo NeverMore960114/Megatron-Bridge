@@ -553,6 +553,11 @@ class WanLayerWithAdaLN(TransformerLayer):
 
         return output, context
 
+def log_checkpoint(tag):
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[{tag}] alloc={alloc:.2f} GB reserved={reserved:.2f} GB")
 
 class VACEBaseLayer(WanLayerWithAdaLN):
     """A single transformer layer.
@@ -593,6 +598,8 @@ class VACEBaseLayer(WanLayerWithAdaLN):
         inference_context=None,
     ):
         
+        log_checkpoint("before base")
+        
         hidden_states, context = super().forward(
             hidden_states, 
             attention_mask=attention_mask,
@@ -613,7 +620,9 @@ class VACEBaseLayer(WanLayerWithAdaLN):
             hidden_states = hidden_states + context_mask[self.idx] * self.context_scale
             # hidden_states = hidden_states + context_mask[self.idx] * 2.0
             # hidden_states = hidden_states + torch.rand_like(context_mask[self.idx]) * 0.05
-
+            
+        log_checkpoint(f"after base {self.idx}")
+        
         return hidden_states, context
    
     
@@ -685,6 +694,8 @@ class VACEContextLayer(WanLayerWithAdaLN):
         inference_context=None,
     ):  
         
+        log_checkpoint("before context")
+        
         all_hidden_states = list(torch.unbind(hidden_states))
         hidden_states = all_hidden_states.pop(-1)
         hidden_states, context = super().forward(
@@ -704,7 +715,9 @@ class VACEContextLayer(WanLayerWithAdaLN):
         hidden_states_proj, bias = self.context_proj(hidden_states)
         all_hidden_states += [hidden_states_proj, hidden_states]
         hidden_states = torch.stack(all_hidden_states)
-
+        
+        log_checkpoint("after context")
+        
         return hidden_states, context
 
 

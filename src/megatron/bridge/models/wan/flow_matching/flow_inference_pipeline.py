@@ -576,6 +576,11 @@ class FlowInferencePipeline:
         return videos if self.rank == 0 else None
 
 
+def log_checkpoint(tag):
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    print(f"[{tag}] alloc={alloc:.2f} GB reserved={reserved:.2f} GB")
 
 
 class VACEFlowInferencePipeline:
@@ -635,7 +640,8 @@ class VACEFlowInferencePipeline:
             checkpoint_path=os.path.join(t5_checkpoint_dir, config.t5_checkpoint),
             tokenizer_path=os.path.join(t5_checkpoint_dir, config.t5_tokenizer),
             shard_fn=None)
-
+        
+        log_checkpoint("before vae")
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size        
         self.vae = WanVAE(
@@ -654,7 +660,8 @@ class VACEFlowInferencePipeline:
         if dist.is_initialized():
             dist.barrier()
         self.model.to(self.device)
-
+        log_checkpoint("after transformer")
+        
         self.sample_neg_prompt = config.sample_neg_prompt
         
         self.vid_proc = VaceVideoProcessor(downsample=tuple([x * y for x, y in zip(self.vae_stride, self.patch_size)]),
