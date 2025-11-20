@@ -9,7 +9,7 @@ CHECKPOINT_DIR=/opt/megatron_checkpoint_VACE
 T5_DIR=/opt/Wan2.1-T2V-1.3B
 VAE_DIR=/opt/Wan2.1-T2V-1.3B
 
-NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 examples/recipes/wan/inference_vace.py \
+NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 examples/recipes/wan/inference_vace.py \
   --model_name vace-1.3B \
   --sizes 832*480 \
   --save_file "depth" \
@@ -21,8 +21,26 @@ NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 --rdzv-backend=c10d --rdzv-endpoin
   --prompts "Two dogs hit each other during boxing." \
   --frame_nums 81 \
   --tensor_parallel_size 1 \
-  --context_parallel_size 1 \
+  --context_parallel_size 2 \
   --pipeline_parallel_size 1 \
   --sequence_parallel False \
   --base_seed 42 \
   --sample_steps 50
+
+# NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoint=localhost:0 examples/recipes/wan/inference_vace.py \
+#   --model_name vace-1.3B \
+#   --sizes 832*480 832*480 \
+#   --save_file "depth" \
+#   --src_video "src_video_depth.mp4" \
+#   --checkpoint_dir ${CHECKPOINT_DIR} \
+#   --checkpoint_step 0000 \
+#   --t5_checkpoint_dir ${T5_DIR} \
+#   --vae_checkpoint_dir ${VAE_DIR} \
+#   --prompts "Two dogs hit each other during boxing." "Two dogs hit each other during boxing." \
+#   --frame_nums 81 81 \
+#   --tensor_parallel_size 1 \
+#   --context_parallel_size 2 \
+#   --pipeline_parallel_size 1 \
+#   --sequence_parallel False \
+#   --base_seed 42 \
+#   --sample_steps 50

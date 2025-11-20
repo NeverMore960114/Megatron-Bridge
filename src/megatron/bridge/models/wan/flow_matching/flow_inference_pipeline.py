@@ -94,6 +94,8 @@ class FlowInferencePipeline:
             tokenizer_path=os.path.join(t5_checkpoint_dir, config.t5_tokenizer),
             shard_fn=None)
 
+        log_checkpoint("before vae")
+        
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size        
         self.vae = WanVAE(
@@ -112,6 +114,8 @@ class FlowInferencePipeline:
         if dist.is_initialized():
             dist.barrier()
         self.model.to(self.device)
+        
+        log_checkpoint("after transformer")
 
         self.sample_neg_prompt = config.sample_neg_prompt
         
@@ -642,6 +646,7 @@ class VACEFlowInferencePipeline:
             shard_fn=None)
         
         log_checkpoint("before vae")
+        
         self.vae_stride = config.vae_stride
         self.patch_size = config.patch_size        
         self.vae = WanVAE(
@@ -660,6 +665,7 @@ class VACEFlowInferencePipeline:
         if dist.is_initialized():
             dist.barrier()
         self.model.to(self.device)
+        
         log_checkpoint("after transformer")
         
         self.sample_neg_prompt = config.sample_neg_prompt

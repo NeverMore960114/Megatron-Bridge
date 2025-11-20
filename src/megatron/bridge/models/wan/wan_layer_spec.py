@@ -480,6 +480,9 @@ class WanLayerWithAdaLN(TransformerLayer):
         sequence_len_offset=None,
         inference_context=None,
     ):
+        
+        # log_checkpoint("before layer")
+        
         # the timestep embedding is stored in attention_mask argument
         timestep_emb = attention_mask
         rope_emb = rotary_pos_emb
@@ -550,7 +553,9 @@ class WanLayerWithAdaLN(TransformerLayer):
         # 'view' tensor. ???
         output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
         # output = hidden_states
-
+        
+        # log_checkpoint("after layer")
+        
         return output, context
 
 def log_checkpoint(tag):
@@ -695,11 +700,11 @@ class VACEContextLayer(WanLayerWithAdaLN):
     ):  
         
         log_checkpoint("before context")
-        
-        all_hidden_states = list(torch.unbind(hidden_states))
-        hidden_states = all_hidden_states.pop(-1)
-        hidden_states, context = super().forward(
-            hidden_states, 
+
+        # all_hidden_states = list(torch.unbind(hidden_states))
+        # hidden_states = all_hidden_states.pop(-1)
+        hidden_state, context = super().forward(
+            hidden_states[self.idx], 
             attention_mask=attention_mask,
             context=context,
             context_mask=None,
@@ -712,9 +717,10 @@ class VACEContextLayer(WanLayerWithAdaLN):
             sequence_len_offset=sequence_len_offset,
             inference_context=inference_context,
         )
-        hidden_states_proj, bias = self.context_proj(hidden_states)
-        all_hidden_states += [hidden_states_proj, hidden_states]
-        hidden_states = torch.stack(all_hidden_states)
+        hidden_states[self.idx] = self.context_proj(hidden_state)[0]
+        hidden_states[self.idx + 1] = hidden_state
+        # all_hidden_states += [hidden_states_proj, hidden_states]
+        # hidden_states = torch.stack(all_hidden_states)
         
         log_checkpoint("after context")
         

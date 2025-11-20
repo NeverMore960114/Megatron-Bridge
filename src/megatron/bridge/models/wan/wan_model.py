@@ -46,7 +46,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.utils import get_pg_rank
 
-class IndexTransformerBlock(TransformerBlock):
+class BaseTransformerBlock(TransformerBlock):
     def __init__(
         self,
         config: TransformerConfig,
@@ -113,6 +113,96 @@ class IndexTransformerBlock(TransformerBlock):
                 if idx in self.vace_layers:
                     module.idx = self.vace_layers_mapping[idx]
                     module.context_scale = self.config.context_scale
+                else:
+                    module.idx = None
+            return module
+
+        # offset is implicit in TransformerLayer
+        self.layers = torch.nn.ModuleList(
+            [
+                build_layer(layer_spec, i + 1)
+                for i, layer_spec in enumerate(self.submodules.layer_specs)
+            ]
+        )
+
+        # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
+        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+        # self.post_process and self.post_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.final_layernorm = None  # Either this or nn.Identity
+            
+class ContextTransformerBlock(TransformerBlock):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
+        pg_collection: ProcessGroupCollection = None,
+        vp_stage: Optional[int] = None,
+    ):
+        # Pass block id and context_scale
+        self.vace_id = [i for i in range(0, config.num_layers)] if config.vace_layers is None else [i for i in range(0, len(config.vace_layers))]
+        print(self.vace_id)
+        assert 0 in self.vace_id
+        
+        super().__init__(
+            config=config, 
+            spec=spec,
+            post_layer_norm=post_layer_norm,
+            pre_process=pre_process,
+            post_process=post_process,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+        )
+    
+    def _build_layers(self):
+        # Transformer layers.
+        # @jcasper can we improve how we deal with layer_number?
+        # currently it's only used in CoreAttention?
+        # if self.apply_query_key_layer_scaling:
+        #     coeff = self.layer_number
+        #     self.norm_factor *= coeff
+        def build_layer(layer_spec, layer_number):
+            global_layer_number = layer_number + get_transformer_layer_offset(
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+            )  # 1-based index
+            if self.config.heterogeneous_block_specs:
+                layer_config = self.config.get_config_for_layer(global_layer_number)
+            else:
+                layer_config = self.config
+
+            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
+            if layer_config.fp8:
+                quantization_context = get_fp8_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            elif layer_config.fp4:
+                quantization_context = get_fp4_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            else:
+                quantization_context = nullcontext()
+
+            with quantization_context:
+                module = build_module(
+                    layer_spec,
+                    config=layer_config,
+                    layer_number=layer_number,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
+                )
+                idx = global_layer_number - 1
+                if idx in self.vace_id:
+                    module.idx = idx
                 else:
                     module.idx = None
             return module
@@ -464,7 +554,7 @@ class VACEModel(WanModel):
             self.vace_patch_embedding = nn.Conv3d(
                 self.vace_in_channels, self.config.hidden_size, kernel_size=self.patch_size, stride=self.patch_size)
             
-        self.decoder = IndexTransformerBlock(
+        self.decoder = BaseTransformerBlock(
             config=self.config,
             spec=self.transformer_decoder_layer_spec,
             pre_process=self.pre_process,
@@ -474,7 +564,7 @@ class VACEModel(WanModel):
         # print(self.decoder)
         self.vace_config = copy.deepcopy(self.config)
         self.vace_config.num_layers = len(self.decoder.vace_layers)
-        self.vace_decoder = TransformerBlock(
+        self.vace_decoder = ContextTransformerBlock(
             config=self.vace_config,
             spec=self.vace_transformer_decoder_layer_spec,
             pre_process=self.pre_process,
@@ -537,7 +627,8 @@ class VACEModel(WanModel):
             vace_context = vace_context.flatten(1) # output: vace_context.shape [s * b, hidden_size]
             vace_context = vace_context.reshape(vace_seq_len, batch_size, -1) # output: vace_context.shape [s, b, hidden_size]
             vace_context = self.vace_init_proj(vace_context) + x
-            vace_context = vace_context.unsqueeze(0)
+            # vace_context = vace_context.unsqueeze(0)
+            vace_context = torch.stack([vace_context] * (self.vace_config.num_layers + 1))
             
             # split sequence for sequence_parallel
             # TODO: for PP, do we move scatter_to_sequence_parallel_region here or after "x = self.decoder.input_tensor" ???

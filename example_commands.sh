@@ -58,8 +58,8 @@ export CUDA_VISIBLE_DEVICES=0,1
 #   VAE: Wan2.1_VAE.pth
 
 CHECKPOINT_DIR=/opt/megatron_checkpoint_WAN
-T5_DIR=~/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a
-VAE_DIR=~/.cache/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B/snapshots/37ec512624d61f7aa208f7ea8140a131f93afc9a
+T5_DIR=/opt/Wan2.1-T2V-1.3B
+VAE_DIR=/opt/Wan2.1-T2V-1.3B
 # cd $MBRIDGE_PATH
 # NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=1 examples/recipes/wan/inference_wan.py \
 #   --task t2v-1.3B \
