@@ -658,6 +658,9 @@ class VACEModel(WanModel):
         n_head, dim_head = self.num_heads, self.config.hidden_size // self.num_heads
         rotary_pos_emb = self.rope_embeddings(n_head, dim_head, max_seq_len, grid_sizes, t.device) # output: rotary_pos_emb.shape [s, b, 1, dim_head]
 
+        s, b, sq, h = rotary_pos_emb.shape
+        rotary_pos_emb = rotary_pos_emb.transpose(0, 1).reshape(s*b, 1, sq, h)
+        
         # run vace decoder
         vace_context = self.vace_decoder(
             hidden_states=vace_context,

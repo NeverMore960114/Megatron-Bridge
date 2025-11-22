@@ -603,7 +603,7 @@ class VACEBaseLayer(WanLayerWithAdaLN):
         inference_context=None,
     ):
         
-        log_checkpoint("before base")
+        # log_checkpoint("before base")
         
         hidden_states, context = super().forward(
             hidden_states, 
@@ -626,7 +626,7 @@ class VACEBaseLayer(WanLayerWithAdaLN):
             # hidden_states = hidden_states + context_mask[self.idx] * 2.0
             # hidden_states = hidden_states + torch.rand_like(context_mask[self.idx]) * 0.05
             
-        log_checkpoint(f"after base {self.idx}")
+        # log_checkpoint(f"after base {self.idx}")
         
         return hidden_states, context
    
@@ -699,7 +699,7 @@ class VACEContextLayer(WanLayerWithAdaLN):
         inference_context=None,
     ):  
         
-        log_checkpoint("before context")
+        # log_checkpoint("before context")
 
         # all_hidden_states = list(torch.unbind(hidden_states))
         # hidden_states = all_hidden_states.pop(-1)
@@ -722,7 +722,7 @@ class VACEContextLayer(WanLayerWithAdaLN):
         # all_hidden_states += [hidden_states_proj, hidden_states]
         # hidden_states = torch.stack(all_hidden_states)
         
-        log_checkpoint("after context")
+        # log_checkpoint("after context")
         
         return hidden_states, context
 

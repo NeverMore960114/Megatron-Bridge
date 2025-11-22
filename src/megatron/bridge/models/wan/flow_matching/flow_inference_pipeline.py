@@ -1073,6 +1073,8 @@ class VACEFlowInferencePipeline:
             vace_context[i] = F.pad(vace_context[i], (0, 0, 0, max_video_seq_len - vace_context[i].shape[0]))
         vace_context = torch.stack(vace_context, dim=1)
         
+        s, b, h = vace_context.shape
+        vace_context = vace_context.transpose(0, 1).reshape(s*b, 1, h)
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -1105,6 +1107,9 @@ class VACEFlowInferencePipeline:
         contexts = torch.stack(contexts, dim=1)
         contexts_null = torch.stack(contexts_null, dim=1)
         
+        s, b, h = contexts.shape
+        contexts = contexts.transpose(0, 1).reshape(s*b, 1, h)
+        contexts_null = contexts_null.transpose(0, 1).reshape(s*b, 1, h)
         
         ## setup noise
         noises = []
@@ -1119,7 +1124,7 @@ class VACEFlowInferencePipeline:
                     device=self.device,
                     generator=seed_g)
             )
-
+        # noises = noises[:1] * len(noises)
 
         # calculate grid_sizes
         grid_sizes = [grid_sizes_calculation(
@@ -1221,6 +1226,8 @@ class VACEFlowInferencePipeline:
                     latents[i] = F.pad(latents[i], (0, 0, 0, max_video_seq_len - latents[i].shape[0]))
                 latents = torch.stack(latents, dim=1)
 
+                s, b, h = latents.shape
+                latents = latents.transpose(0, 1).reshape(s*b, 1, h)
 
                 # context parallel
                 if parallel_state.get_context_parallel_world_size() > 1:
@@ -1228,7 +1235,7 @@ class VACEFlowInferencePipeline:
 
 
                 latent_model_input = latents
-                timestep = [t] * batch_size
+                timestep = [t] * 1
                 timestep = torch.stack(timestep)
 
                 self.model.to(self.device)
@@ -1244,6 +1251,8 @@ class VACEFlowInferencePipeline:
                     noise_pred_cond = thd_cat_outputs_cp(noise_pred_cond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
                     noise_pred_uncond = thd_cat_outputs_cp(noise_pred_uncond, packed_seq_params['self_attention'].cu_seqlens_q, parallel_state.get_context_parallel_group())
 
+                noise_pred_cond = noise_pred_cond.reshape(b, s, h).transpose(0, 1)
+                noise_pred_uncond = noise_pred_uncond.reshape(b, s, h).transpose(0, 1)
 
                 # run unpatchify
                 unpatchified_noise_pred_cond = noise_pred_cond

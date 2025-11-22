@@ -240,32 +240,32 @@ def generate(args):
     if args.prompts is None:
         prompts = [None]
     else:
-        prompts = args.prompts
+        prompts = args.prompts * 8
         
     if args.src_video is None:
-        src_video = [None]
+        src_video = [None] * len(prompts)
     else:
-        src_video = args.src_video
+        src_video = args.src_video * 8
         
     if args.src_mask is None:
-        src_mask = [None]
+        src_mask = [None] * len(prompts)
     else:
-        src_mask = args.src_mask
+        src_mask = args.src_mask * 8
         
     if args.src_ref_images is None:
-        src_ref_images = [None]
+        src_ref_images = [None] * len(prompts)
     else:
-        src_ref_images = args.src_ref_images
+        src_ref_images = args.src_ref_images * 8
 
     # Resolve sizes list (default to first supported size for task)
     if args.sizes is not None and len(args.sizes) > 0:
-        size_keys = args.sizes
+        size_keys = args.sizes * 8
     else:
         size_keys = [SUPPORTED_SIZES[args.model_name][0]]
 
     # Resolve frame counts list (default 81)
     if args.frame_nums is not None and len(args.frame_nums) > 0:
-        frame_nums = args.frame_nums
+        frame_nums = args.frame_nums * 8
     else:
         frame_nums = [81]
 
