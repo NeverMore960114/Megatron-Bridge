@@ -593,6 +593,7 @@ class VACEBaseLayer(WanLayerWithAdaLN):
         attention_mask=None,
         context=None,
         context_mask=None,
+        context_signal=None,
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
@@ -620,11 +621,11 @@ class VACEBaseLayer(WanLayerWithAdaLN):
             inference_context=inference_context,
         )
         # consider how to pass block id and context_scale
-        # the context_tokens from context branch is stored in context_mask argument
+        # the context_tokens from context branch is stored in context_signal argument
         if self.idx is not None:
-            hidden_states = hidden_states + context_mask[self.idx] * self.context_scale
-            # hidden_states = hidden_states + context_mask[self.idx] * 2.0
-            # hidden_states = hidden_states + torch.rand_like(context_mask[self.idx]) * 0.05
+            hidden_states = hidden_states + context_signal[self.idx] * self.context_scale
+            # hidden_states = hidden_states + context_signal[self.idx] * 2.0
+            # hidden_states = hidden_states + torch.rand_like(context_signal[self.idx]) * 0.05
             
         # log_checkpoint(f"after base {self.idx}")
         
@@ -689,6 +690,7 @@ class VACEContextLayer(WanLayerWithAdaLN):
         attention_mask=None,
         context=None,
         context_mask=None,
+        context_signal=None,
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
@@ -701,10 +703,8 @@ class VACEContextLayer(WanLayerWithAdaLN):
         
         # log_checkpoint("before context")
 
-        # all_hidden_states = list(torch.unbind(hidden_states))
-        # hidden_states = all_hidden_states.pop(-1)
-        hidden_state, context = super().forward(
-            hidden_states[self.idx], 
+        hidden_states, context = super().forward(
+            hidden_states, 
             attention_mask=attention_mask,
             context=context,
             context_mask=None,
@@ -717,14 +717,11 @@ class VACEContextLayer(WanLayerWithAdaLN):
             sequence_len_offset=sequence_len_offset,
             inference_context=inference_context,
         )
-        hidden_states[self.idx] = self.context_proj(hidden_state)[0]
-        hidden_states[self.idx + 1] = hidden_state
-        # all_hidden_states += [hidden_states_proj, hidden_states]
-        # hidden_states = torch.stack(all_hidden_states)
+        context_signal[self.idx] = self.context_proj(hidden_states)[0]
         
         # log_checkpoint("after context")
         
-        return hidden_states, context
+        return hidden_states, context_signal
 
 
 import transformer_engine as te
