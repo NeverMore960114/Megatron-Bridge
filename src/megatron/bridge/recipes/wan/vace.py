@@ -15,7 +15,7 @@
 import os
 from typing import List, Optional, Union
 
-from megatron.bridge.data.wan.wan_energon_datamodule import WanDataModuleConfig
+from megatron.bridge.data.wan.wan_energon_datamodule import WanDataModuleConfig, VaceDataModuleConfig
 from megatron.bridge.models.wan.wan_provider import VACEModelProvider
 import torch
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -46,6 +46,7 @@ def vace_model_config(
     vace_in_channels: int = 96,
     base_num_layers: int = 30,
     context_scale: float = 1.0,
+    freeze_base_model: bool = False,
 ) -> VACEModelProvider:
     """
     Configure the VACE model.
@@ -62,6 +63,7 @@ def vace_model_config(
         vace_in_channels (int): Number of input channels for VACE.
         base_num_layers (int): Base number of layers in the model.
         context_scale (float): Scale factor for context attention.
+        freeze_base_model (bool): Whether to freeze base WAN model parameters (only train VACE layers).
     Returns:
         VACEModelProvider: Configuration for the VACE model.
     """
@@ -77,6 +79,7 @@ def vace_model_config(
         vace_in_channels=vace_in_channels,
         base_num_layers=base_num_layers,
         context_scale=context_scale,
+        freeze_base_model=freeze_base_model,
     )
 
 
@@ -104,6 +107,7 @@ def vace_pretrain_config(
     vace_in_channels: int = 96,
     base_num_layers: int = 30,
     context_scale: float = 1.0,
+    freeze_base_model: bool = True,
     # Training hyperparameters
     train_iters: int = 10000,
     global_batch_size: int = 4,
@@ -152,6 +156,7 @@ def vace_pretrain_config(
         vace_in_channels (int): Number of input channels for VACE.
         base_num_layers (int): Base number of layers in the model.
         context_scale (float): Scale factor for context attention.
+        freeze_base_model (bool): Whether to freeze base WAN model parameters (only train VACE layers).
         train_iters (int): Total number of training iterations.
         global_batch_size (int): Global batch size for training.
         micro_batch_size (int): Micro batch size for training.
@@ -191,6 +196,7 @@ def vace_pretrain_config(
         vace_in_channels=vace_in_channels,
         base_num_layers=base_num_layers,
         context_scale=context_scale,
+        freeze_base_model=freeze_base_model,
     )
 
     # Setup optimizer and scheduler
@@ -265,7 +271,7 @@ def vace_pretrain_config(
             use_distributed_optimizer=True,
             use_megatron_fsdp=use_megatron_fsdp,
         ),
-        dataset=WanDataModuleConfig(
+        dataset=VaceDataModuleConfig(
             path=data_path,
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,

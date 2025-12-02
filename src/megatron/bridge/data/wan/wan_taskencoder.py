@@ -43,6 +43,28 @@ def cook(sample: dict) -> dict:
         pickle=sample["pickle"],
     )
 
+def cook_vace(sample: dict) -> dict:
+    """
+    Processes a raw sample dictionary from energon dataset and returns a new dictionary with specific keys.
+
+    Args:
+        sample (dict): The input dictionary containing the raw sample data.
+
+    Returns:
+        dict: A new dictionary containing the processed sample data with the following keys:
+            - All keys from the result of `basic_sample_keys(sample)`
+            - 'json': The contains meta data like resolution, aspect ratio, fps, etc.
+            - 'pth': contains video latent tensor
+            - 'pickle': contains text embeddings
+    """
+    return dict(
+        **basic_sample_keys(sample),
+        json=sample["json"],
+        pth=sample["pth"],
+        pickle=sample["pickle"],
+        context_pth=sample["context.pth"],
+    )
+
 
 class WanTaskEncoder(DefaultTaskEncoder):
     """
@@ -190,3 +212,108 @@ class WanTaskEncoder(DefaultTaskEncoder):
             seq_len_kv = seq_len_kv,
             video_metadata = video_metadata,
         )
+    
+class VaceTaskEncoder(WanTaskEncoder):
+    """
+    Task encoder for VACE datasets.
+
+    Extends WanTaskEncoder by additionally reading `vace_context` from the
+    energon sample (stored as `context.pth`) and batching it alongside the
+    video latents, text embeddings, and metadata.
+    """
+
+    # Use a cooker that extracts the additional `context.pth` key
+    cookers = [
+        Cooker(cook_vace),
+    ]
+
+    def encode_sample(self, sample: dict) -> dict:
+        """Encode single VACE sample, including vace_context.
+
+        Expected sample keys (post-cook):
+        - pth: video latents tensor
+        - pickle: text embeddings
+        - json: metadata
+        - context_pth: vace context latents tensor
+        """
+
+        video_latent = sample["pth"]
+        context_embeddings = sample["pickle"]
+        video_metadata = sample["json"]
+        vace_context = sample.get("context_pth", None)
+
+        # Sanity checks on video latents
+        if torch.isnan(video_latent).any() or torch.isinf(video_latent).any():
+            raise SkipSample()
+        if torch.max(torch.abs(video_latent)) > 1e3:
+            raise SkipSample()
+
+        # calculate grid size for video latents
+        grid_size = grid_sizes_calculation(
+            input_shape=video_latent.shape[1:],
+            patch_size=(self.patch_temporal, self.patch_spatial, self.patch_spatial),
+        )
+
+        encoded = dict(
+            video_latent=video_latent,
+            grid_size=grid_size,
+            context_embeddings=context_embeddings,
+            video_metadata=video_metadata,
+        )
+
+        # Optional: include vace_context if present
+        if vace_context is not None:
+            encoded["vace_context"] = vace_context
+
+        return encoded
+
+    def batch(self, samples: list[dict]) -> dict:
+        """Batch VACE samples, padding vace_context to match sequence length.
+
+        The vace_context is expected to have its first dimension aligned with the
+        patchified sequence dimension of video latents. If shapes are incompatible,
+        the sample is skipped.
+        """
+
+        # First, run base batching for video/text/metadata
+        base = super().batch(samples)
+
+        # If none of the samples include vace_context, return base
+        if not any("vace_context" in s for s in samples):
+            return base
+
+        # Prepare/pad vace_context to [S_max, B, ...] like video_latents
+        vace_context_list = []
+        seq_lengths = []
+        for s in samples:
+            vc = s.get("vace_context", None)
+            if vc is None:
+                raise SkipSample()
+            
+            # Dataset provides pre-patchified 2D tensors [num_patches, feature_dim]
+            if vc.ndim != 2:
+                raise SkipSample(f"Expected 2D vace_context, got shape {vc.shape}")
+            
+            # Ensure tensor dtype/device consistency
+            vc = vc.to(dtype=base["video_latents"].dtype, device=base["video_latents"].device)
+            seq_lengths.append(vc.shape[0])
+            vace_context_list.append(vc)
+
+        # Determine max sequence length used for video_latents in base (after padding)
+        S_max = base["max_video_seq_len"]
+
+        # Pad each vace_context to S_max along the first dimension and stack to [S_max, B, ...]
+        # vace_context tensors are 2D [S, D] for the model
+        if not all(vc.ndim == 2 for vc in vace_context_list):
+            raise SkipSample()
+        vace_context_list = [F.pad(vc, (0, 0, 0, S_max - vc.shape[0])) for vc in vace_context_list]
+
+        # Stack along batch dim 1 for consistency with video_latents [S_max, B, ...]
+        try:
+            vace_context = torch.stack(vace_context_list, dim=1)
+        except Exception:
+            # If stacking fails due to mismatched trailing dims, skip these samples
+            raise SkipSample()
+
+        base["vace_context"] = vace_context
+        return base

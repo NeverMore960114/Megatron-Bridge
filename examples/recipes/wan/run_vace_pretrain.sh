@@ -5,41 +5,42 @@
 # Exit on error
 set -e
 
+### Prepare energon dataset
+cd /workspace/Megatron-Bridge && \
+# python src/megatron/bridge/data/wan/prepare_energon_dataset_wan.py \
+#   --video_folder /workspace/all_mixkit \
+#   --output_dir /workspace/all_mixkit_energon \
+#   --model Wan-AI/Wan2.1-T2V-14B-Diffusers \
+#   --device cuda \
+#   --height 224 --width 224 --resize_mode bilinear --center-crop \
+#   --shard_maxcount 100 \
+#   --no-memory-optimization 2>&1 | tee /tmp/prepare_log.txt
+
+python src/megatron/bridge/data/wan/prepare_energon_dataset_vace.py \
+  --video_dir /workspace/all_mixkit \
+  --output_dir /workspace/all_mixkit_energon_vace \
+  --checkpoint_dir /opt/megatron_checkpoint_VACE \
+  --t5_checkpoint_dir /workspace/checkpoints/T5 \
+  --vae_checkpoint_dir /workspace/checkpoints/ \
+  --vace_mode I2V \
+  --device cuda \
+  --height 224 --width 224 --resize_mode bilinear --center-crop \
+  --shard_maxcount 100 2>&1 | tee /tmp/prepare_log.txt
+
+energon prepare /workspace/all_mixkit_energon
+
 # ============================
 # Configuration Parameters
 # ============================
+export MBRIDGE_PATH=/workspace/vace/Megatron-Bridge
+export PYTHONPATH="${MBRIDGE_PATH}/.:${MBRIDGE_PATH}/src/.:/opt/NeMo-Framework-Launcher/launcher_scripts"
 
-# Dataset path - Update this to point to your energon dataset
-DATASET_PATH="${DATASET_PATH:-/workspace/all_mixkit_energon}"
 
-# Checkpoint directories
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/workspace/checkpoints/megatron_checkpoint_1.3B}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/workspace/checkpoints_ft}"
+DATASET_PATH="/workspace/all_mixkit_energon_vace"
+PRETRAINED_CHECKPOINT="/opt/megatron_checkpoint_VACE"
+CHECKPOINT_DIR="/workspace/checkpoints_vace_ft"
+EXP_NAME=wan_vace_ft
 
-# Experiment name
-EXP_NAME="${EXP_NAME:-vace_mixkit_finetune}"
-
-# Model parallelism settings
-TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
-PIPELINE_PARALLEL="${PIPELINE_PARALLEL:-1}"
-CONTEXT_PARALLEL="${CONTEXT_PARALLEL:-1}"
-
-# Training hyperparameters
-LEARNING_RATE="${LEARNING_RATE:-5e-6}"
-MIN_LEARNING_RATE="${MIN_LEARNING_RATE:-5e-6}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-SEQ_LENGTH="${SEQ_LENGTH:-24}"
-
-# Training iterations and intervals
-TRAIN_ITERS="${TRAIN_ITERS:-10000}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
-LOG_INTERVAL="${LOG_INTERVAL:-1}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-200}"
-EVAL_ITERS="${EVAL_ITERS:-0}"
-
-# Number of GPUs
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 # ============================
 # Validation
@@ -58,74 +59,43 @@ if [ ! -d "$PRETRAINED_CHECKPOINT" ]; then
     echo "Will start training from scratch or use checkpoint from CHECKPOINT_DIR if available"
 fi
 
-# ============================
-# Environment Setup
-# ============================
-
-echo "=========================================="
-echo "VACE Finetuning Configuration"
-echo "=========================================="
-echo "Dataset Path: $DATASET_PATH"
-echo "Pretrained Checkpoint: $PRETRAINED_CHECKPOINT"
-echo "Output Checkpoint Dir: $CHECKPOINT_DIR"
-echo "Experiment Name: $EXP_NAME"
-echo "Tensor Parallel: $TENSOR_PARALLEL"
-echo "Pipeline Parallel: $PIPELINE_PARALLEL"
-echo "Context Parallel: $CONTEXT_PARALLEL"
-echo "Learning Rate: $LEARNING_RATE"
-echo "Global Batch Size: $GLOBAL_BATCH_SIZE"
-echo "Micro Batch Size: $MICRO_BATCH_SIZE"
-echo "Sequence Length: $SEQ_LENGTH"
-echo "Number of GPUs: $NPROC_PER_NODE"
-echo "=========================================="
-echo ""
-
-# Create checkpoint directory if it doesn't exist
-mkdir -p "$CHECKPOINT_DIR"
 
 # ============================
 # Launch Training
 # ============================
 
-# Enable fused attention for better performance
-export NVTE_FUSED_ATTN=1
-
-# Get the script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
 echo "Starting VACE finetuning..."
 echo ""
 
-torchrun --nproc_per_node=$NPROC_PER_NODE \
-    "$SCRIPT_DIR/pretrain_vace.py" \
-    model.tensor_model_parallel_size=$TENSOR_PARALLEL \
-    model.pipeline_model_parallel_size=$PIPELINE_PARALLEL \
-    model.context_parallel_size=$CONTEXT_PARALLEL \
+NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 examples/recipes/wan/pretrain_vace.py \
+    model.tensor_model_parallel_size=2 \
+    model.pipeline_model_parallel_size=1 \
+    model.context_parallel_size=1 \
     model.sequence_parallel=false \
     model.qkv_format=thd \
-    dataset.path="$DATASET_PATH" \
-    checkpoint.save="$CHECKPOINT_DIR" \
-    checkpoint.load="$PRETRAINED_CHECKPOINT" \
+    dataset.path=${DATASET_PATH} \
+    dataset.num_workers=2 \
+    checkpoint.save=${CHECKPOINT_DIR} \
+    checkpoint.load=${PRETRAINED_CHECKPOINT} \
     checkpoint.load_optim=false \
-    checkpoint.save_interval=$SAVE_INTERVAL \
-    optimizer.lr=$LEARNING_RATE \
-    optimizer.min_lr=$MIN_LEARNING_RATE \
-    train.eval_iters=$EVAL_ITERS \
-    train.eval_interval=$EVAL_INTERVAL \
+    checkpoint.save_interval=200 \
+    optimizer.lr=5e-6 \
+    optimizer.min_lr=5e-6 \
+    train.eval_iters=0 \
     scheduler.lr_decay_style=constant \
     scheduler.lr_warmup_iters=0 \
-    model.seq_length=$SEQ_LENGTH \
-    dataset.seq_length=$SEQ_LENGTH \
-    train.train_iters=$TRAIN_ITERS \
-    train.global_batch_size=$GLOBAL_BATCH_SIZE \
-    train.micro_batch_size=$MICRO_BATCH_SIZE \
-    dataset.global_batch_size=$GLOBAL_BATCH_SIZE \
-    dataset.micro_batch_size=$MICRO_BATCH_SIZE \
-    logger.log_interval=$LOG_INTERVAL \
+    model.seq_length=512 \
+    dataset.seq_length=512 \
+    train.global_batch_size=2 \
+    train.micro_batch_size=1 \
+    dataset.global_batch_size=2 \
+    dataset.micro_batch_size=1 \
+    logger.log_interval=1 \
     logger.wandb_project="vace" \
-    logger.wandb_exp_name="$EXP_NAME" \
-    logger.wandb_save_dir="$CHECKPOINT_DIR"
-
+    logger.wandb_exp_name=${EXP_NAME} \
+    logger.wandb_save_dir=${CHECKPOINT_DIR}
+    # train.train_iters=$TRAIN_ITERS \
+    # train.eval_interval=$EVAL_INTERVAL \
 echo ""
 echo "=========================================="
 echo "VACE Finetuning Complete!"

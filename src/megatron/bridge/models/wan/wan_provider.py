@@ -89,6 +89,7 @@ class VACEModelProvider(WanModelProvider):
     vace_in_channels: int = 96
     base_num_layers: int = 30
     context_scale: float = 1.0
+    freeze_base_model: bool = False
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> VACEModel:
         vp_size = self.virtual_pipeline_model_parallel_size

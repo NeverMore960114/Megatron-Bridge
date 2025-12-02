@@ -56,10 +56,11 @@ from pathlib import Path
 from typing import Tuple
 
 from omegaconf import OmegaConf
+import wandb
 
 from megatron.bridge.recipes.wan.vace import vace_pretrain_config
 from megatron.bridge.training.config import ConfigContainer
-from megatron.bridge.models.wan.wan_step import WanForwardStep
+from megatron.bridge.models.wan.wan_step import WanForwardStep, VACEForwardStep
 from megatron.bridge.training.pretrain import pretrain
 from megatron.bridge.training.utils.omegaconf_utils import (
     apply_overrides,
@@ -174,9 +175,28 @@ def main() -> None:
         cfg.print_yaml()
         logger.info("----------------------------------")
 
+    # Initialize W&B if configured (only on rank 0)
+    if get_rank_safe() == 0 and hasattr(cfg, 'logger') and hasattr(cfg.logger, 'wandb_project'):
+        if cfg.logger.wandb_project:
+            wandb_config = {
+                'project': cfg.logger.wandb_project,
+                'name': getattr(cfg.logger, 'wandb_exp_name', None),
+                'dir': getattr(cfg.logger, 'wandb_save_dir', None),
+                'config': OmegaConf.to_container(merged_omega_conf, resolve=True)
+            }
+            # Remove None values
+            wandb_config = {k: v for k, v in wandb_config.items() if v is not None}
+            
+            wandb.init(**wandb_config)
+            logger.info(f"W&B initialized: project={cfg.logger.wandb_project}, name={wandb_config.get('name', 'N/A')}")
+
     # Start finetuning
     logger.debug("Starting VACE finetuning...")
-    pretrain(config=cfg, forward_step_func=WanForwardStep())
+    pretrain(config=cfg, forward_step_func=VACEForwardStep())
+    
+    # Finish W&B run
+    if get_rank_safe() == 0:
+        wandb.finish()
 
 
 if __name__ == "__main__":

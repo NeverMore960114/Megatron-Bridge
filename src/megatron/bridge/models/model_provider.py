@@ -209,7 +209,14 @@ class ModelProviderMixin(abc.ABC, Generic[ModelT]):
             seed_kwargs: Additional arguments for `model_parallel_cuda_manual_seed`.
             **model_parallel_kwargs: Additional arguments for `parallel_state.initialize_model_parallel`.
         """
+        # Initialize torch.distributed only if not already initialized.
+        # Provide safe defaults for single-process runs where env vars like RANK/WORLD_SIZE
+        # may not be set (e.g., when not using torchrun).
         if not torch.distributed.is_initialized():
+            os.environ["RANK"] = os.environ.get("RANK", "0")
+            os.environ["WORLD_SIZE"] = os.environ.get("WORLD_SIZE", "1")
+            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+            os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12355")
             torch.cuda.set_device(get_local_rank_preinit())
             torch.distributed.init_process_group("nccl")
 

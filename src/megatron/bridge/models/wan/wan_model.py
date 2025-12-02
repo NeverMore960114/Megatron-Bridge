@@ -1225,6 +1225,57 @@ class VACEModel(WanModel):
         
         self.vace_init_proj = nn.Linear(self.config.hidden_size, self.config.hidden_size)
         
+        # Freeze base WAN parameters if specified
+        if getattr(self.config, 'freeze_base_model', False):
+            self.freeze_base_parameters()
+    
+    def freeze_base_parameters(self):
+        """
+        Freeze all base WAN model parameters, only allow VACE-specific parameters to be trained.
+        
+        Frozen parameters (from base WAN model):
+        - patch_embedding
+        - text_embedding
+        - time_embedding
+        - time_projection
+        - rope_embeddings
+        - decoder.layers (base transformer layers, not VACE layers)
+        - head
+        
+        Trainable parameters (VACE-specific):
+        - vace_patch_embedding
+        - vace_decoder (separate transformer for VACE context)
+        - vace_init_proj
+        - decoder.vace_layers (VACE context attention layers within decoder)
+        """
+        # Freeze base model embeddings
+        for param in self.patch_embedding.parameters():
+            param.requires_grad = False
+        for param in self.text_embedding.parameters():
+            param.requires_grad = False
+        for param in self.time_embedding.parameters():
+            param.requires_grad = False
+        for param in self.time_projection.parameters():
+            param.requires_grad = False
+        for param in self.rope_embeddings.parameters():
+            param.requires_grad = False
+        
+        # Freeze output head
+        for param in self.head.parameters():
+            param.requires_grad = False
+        
+        # Freeze base decoder layers (but not vace_layers)
+        if hasattr(self.decoder, 'layers'):
+            for layer in self.decoder.layers:
+                for param in layer.parameters():
+                    param.requires_grad = False
+        
+        print("[VACEModel] Frozen base WAN model parameters. Only VACE-specific parameters will be trained:")
+        print(f"  - vace_patch_embedding")
+        print(f"  - vace_decoder ({self.vace_config.num_layers} layers)")
+        print(f"  - vace_init_proj")
+        if hasattr(self.decoder, 'vace_layers'):
+            print(f"  - decoder.vace_layers ({len(self.decoder.vace_layers)} VACE context layers)")
     
     def forward(
         self,
@@ -1268,12 +1319,18 @@ class VACEModel(WanModel):
             x = x.reshape(seq_len, batch_size, -1) # output: x.shape [s, b, hidden_size]
             
             # vace_context.shape [s, b, c * pF * pH * pW]
-            vace_seq_len, _, _ = vace_context.shape
-            vace_c = self.vace_in_channels
+            vace_seq_len, _, vace_flat_dim = vace_context.shape
+            # Calculate actual channels from the tensor shape
+            vace_c = vace_flat_dim // (pF * pH * pW)
             # pF, pH, pW = self.patch_size
             vace_context = vace_context.reshape(vace_seq_len * batch_size, pF, pH, pW, vace_c) # output: vace_context.shape [s * b, pF, pH, pW, c]
             vace_context = vace_context.permute(0, 4, 1, 2, 3) # output: vace_context.shape [s * b, c, pF, pH, pW]
-            vace_context = self.vace_patch_embedding(vace_context) # output: vace_context.shape [s * b, hidden_size, 1, 1, 1]
+            # Use patch_embedding if vace_context has same channels as main input (self-editing mode)
+            # Otherwise use vace_patch_embedding for different channel counts
+            if vace_c == self.in_channels:
+                vace_context = self.patch_embedding(vace_context) # output: vace_context.shape [s * b, hidden_size, 1, 1, 1]
+            else:
+                vace_context = self.vace_patch_embedding(vace_context) # output: vace_context.shape [s * b, hidden_size, 1, 1, 1]
             vace_context = vace_context.flatten(1) # output: vace_context.shape [s * b, hidden_size]
             vace_context = vace_context.reshape(vace_seq_len, batch_size, -1) # output: vace_context.shape [s, b, hidden_size]
             vace_context = self.vace_init_proj(vace_context) + x

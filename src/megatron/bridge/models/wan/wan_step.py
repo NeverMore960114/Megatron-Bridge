@@ -21,7 +21,7 @@ from megatron.core import parallel_state
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import get_model_config
-from megatron.bridge.models.wan.flow_matching.flow_pipeline import FlowPipeline
+from megatron.bridge.models.wan.flow_matching.flow_pipeline import FlowPipeline, VACEFlowPipeline
 from megatron.bridge.training.losses import masked_next_token_loss
 from megatron.bridge.training.state import GlobalState
 
@@ -97,6 +97,79 @@ class WanForwardStep:
         # DEBUGGING
         # TODO: do we need to gather output with sequence or context parallelism here
         #       especially when we have pipeline parallelism
+
+        loss = output_tensor
+        if "loss_mask" not in batch or batch["loss_mask"] is None:
+            loss_mask = torch.ones_like(loss)
+        loss_mask = batch["loss_mask"]
+        
+        loss_function = self._create_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+
+        return output_tensor, loss_function
+
+
+    def _create_loss_function(self, loss_mask: torch.Tensor, check_for_nan_in_loss: bool, check_for_spiky_loss: bool) -> partial:
+        """Create a partial loss function with the specified configuration.
+
+        Args:
+            loss_mask: Used to mask out some portions of the loss
+            check_for_nan_in_loss: Whether to check for NaN values in the loss
+            check_for_spiky_loss: Whether to check for spiky loss values
+
+        Returns:
+            A partial function that can be called with output_tensor to compute the loss
+        """
+        return partial(
+            masked_next_token_loss,
+            loss_mask,
+            check_for_nan_in_loss=check_for_nan_in_loss,
+            check_for_spiky_loss=check_for_spiky_loss,
+        )
+
+
+class VACEForwardStep:
+    """
+    Forward step for VACE (Video Editing) models.
+    
+    Uses VACEFlowPipeline which handles the additional vace_context input
+    required by VACEModel.
+    """
+    
+    def __init__(self):
+        self.diffusion_pipeline = VACEFlowPipeline()
+
+
+    def __call__(
+        self, state: GlobalState, data_iterator: Iterable, model: VisionModule
+    ) -> tuple[torch.Tensor, partial]:
+        """
+        Forward training step for VACE models.
+        """
+        timers = state.timers
+        straggler_timer = state.straggler_timer
+
+        config = get_model_config(model)
+ 
+        timers("batch-generator", log_level=2).start()
+
+        qkv_format = getattr(config, "qkv_format", "sbhd")
+        with straggler_timer(bdata=True):
+            batch = wan_data_step(
+                qkv_format, data_iterator
+            )
+        timers("batch-generator").stop()
+        
+        check_for_nan_in_loss = state.cfg.rerun_state_machine.check_for_nan_in_loss
+        check_for_spiky_loss = state.cfg.rerun_state_machine.check_for_spiky_loss
+
+        # run diffusion training step with VACE pipeline
+        with straggler_timer:
+            if parallel_state.is_pipeline_last_stage():
+                output_batch, loss, split_loss_mask = self.diffusion_pipeline.training_step(model, batch)
+                output_tensor = torch.mean(loss, dim=-1)
+                batch["loss_mask"] = split_loss_mask
+            else:
+                output_tensor = self.diffusion_pipeline.training_step(model, batch)
 
         loss = output_tensor
         if "loss_mask" not in batch or batch["loss_mask"] is None:
