@@ -24,32 +24,33 @@ export CUDA_VISIBLE_DEVICES=0,1
 # CHECKPOINT_DIR=/path/to/checkpoint_dir
 # DATASET_PATH=/path/to/dataset
 # cd $MBRIDGE_PATH
-# NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=8 examples/recipes/wan/pretrain_wan.py \
-#   model.tensor_model_parallel_size=1 \
-#   model.pipeline_model_parallel_size=1 \
-#   model.context_parallel_size=4 \
-#   model.sequence_parallel=false \
-#   model.qkv_format=thd \
-#   dataset.path=${DATASET_PATH} \
-#   checkpoint.save=${CHECKPOINT_DIR} \
-#   checkpoint.load=${PRETRAINED_CHECKPOINT} \
-#   checkpoint.load_optim=false \
-#   checkpoint.save_interval=200 \
-#   optimizer.lr=5e-6 \
-#   optimizer.min_lr=5e-6 \
-#   train.eval_iters=0 \
-#   scheduler.lr_decay_style=constant \
-#   scheduler.lr_warmup_iters=0 \
-#   model.seq_length=2048 \
-#   dataset.seq_length=2048 \
-#   train.global_batch_size=1 \
-#   train.micro_batch_size=1 \
-#   dataset.global_batch_size=1 \
-#   dataset.micro_batch_size=1 \
-#   logger.log_interval=1 \
-#   logger.wandb_project="wan" \
-#   logger.wandb_exp_name=${EXP_NAME} \
-#   logger.wandb_save_dir=${CHECKPOINT_DIR}
+NVTE_FUSED_ATTN=1 torchrun --nproc_per_node=2 examples/recipes/wan/pretrain_wan.py \
+  model.tensor_model_parallel_size=1 \
+  model.pipeline_model_parallel_size=1 \
+  model.context_parallel_size=2 \
+  model.sequence_parallel=false \
+  model.qkv_format=thd \
+  dataset.num_workers=0 \
+  dataset.path=${DATASET_PATH} \
+  checkpoint.save=${CHECKPOINT_DIR} \
+  checkpoint.load=${PRETRAINED_CHECKPOINT} \
+  checkpoint.load_optim=false \
+  checkpoint.save_interval=200 \
+  optimizer.lr=5e-6 \
+  optimizer.min_lr=5e-6 \
+  train.eval_iters=0 \
+  scheduler.lr_decay_style=constant \
+  scheduler.lr_warmup_iters=0 \
+  model.seq_length=2048 \
+  dataset.seq_length=2048 \
+  train.global_batch_size=1 \
+  train.micro_batch_size=1 \
+  dataset.global_batch_size=1 \
+  dataset.micro_batch_size=1 \
+  logger.log_interval=1 \
+  logger.wandb_project="wan" \
+  logger.wandb_exp_name=${EXP_NAME} \
+  logger.wandb_save_dir=${CHECKPOINT_DIR}
 
 
 ### Inferencing

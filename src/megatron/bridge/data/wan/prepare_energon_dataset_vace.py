@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 from megatron.bridge.models.wan.flow_matching.flow_inference_pipeline import VACEFlowInferencePipeline
 from megatron.bridge.models.wan.inference.configs import WAN_CONFIGS
+from megatron.bridge.models.wan.utils.utils import patchify
 from diffusers import AutoencoderKLWan
 from transformers import AutoTokenizer, UMT5EncoderModel
 
@@ -83,8 +84,13 @@ def _resize_frame(
             if resized_frame.shape[0] < target_height or resized_frame.shape[1] < target_width:
                 pad_height = max(0, target_height - resized_frame.shape[0])
                 pad_width = max(0, target_width - resized_frame.shape[1])
+                # Handle both 2D (grayscale/mask) and 3D (RGB) frames
+                if resized_frame.ndim == 2:
+                    pad_spec = ((0, pad_height), (0, pad_width))
+                else:
+                    pad_spec = ((0, pad_height), (0, pad_width), (0, 0))
                 resized_frame = np.pad(
-                    resized_frame, ((0, pad_height), (0, pad_width), (0, 0)), mode="constant", constant_values=0
+                    resized_frame, pad_spec, mode="constant", constant_values=0
                 )
 
     return resized_frame
@@ -166,6 +172,7 @@ def _load_frames_cv2(
     maintain_aspect_ratio: bool,
     center_crop: bool,
     target_dtype: torch.dtype,
+    is_mask: bool = False,
 ) -> torch.Tensor:
     cap = cv2.VideoCapture(video_path)
     frames: List[np.ndarray] = []
@@ -175,7 +182,11 @@ def _load_frames_cv2(
         ret, frame = cap.read()
         if not ret:
             break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if is_mask:
+            if frame.ndim == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = _resize_frame(frame, target_size, resize_mode, maintain_aspect_ratio, center_crop)
         frame = frame.astype(np.float32) / 255.0
         frames.append(frame)
@@ -184,37 +195,19 @@ def _load_frames_cv2(
     if not frames:
         raise ValueError(f"No frames loaded from {video_path}")
 
-    video_array = np.array(frames)  # T, H, W, C in [0,1]
-    video_tensor = torch.from_numpy(video_array)  # T, H, W, C
-    video_tensor = video_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # 1, C, T, H, W
+    video_array = np.array(frames)  # T, H, W, C (RGB) or T, H, W (mask) in [0,1]
+    video_tensor = torch.from_numpy(video_array)
+    
+    if is_mask:
+        # For masks: T, H, W -> 1, 1, T, H, W
+        video_tensor = video_tensor.unsqueeze(0).unsqueeze(0)  # 1, 1, T, H, W
+    else:
+        # For RGB: T, H, W, C -> 1, C, T, H, W
+        video_tensor = video_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # 1, C, T, H, W
+    
     video_tensor = video_tensor.to(dtype=target_dtype)
     return video_tensor
 
-
-def read_video_frames(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
-    cap.release()
-    return np.stack(frames) if frames else None
-
-def read_mask_frames(mask_path):
-    cap = cv2.VideoCapture(mask_path)
-    masks = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame.ndim == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        masks.append(frame)
-    cap.release()
-    return np.stack(masks) if masks else None
 
 @torch.no_grad()
 def _encode_video_latents(
@@ -314,9 +307,9 @@ def main():
             prompt = meta["cap"]
             
             video_path = os.path.join(args.video_dir, video_name)
-            video_name_root = os.path.splitext(video_name)[0]
-            src_video_path = os.path.join(args.video_dir, f"{video_name_root}_src_video.mp4")
-            mask_path = os.path.join(args.video_dir, f"{video_name_root}_mask.mp4")
+            video_base = os.path.split(video_path)[0]
+            src_video_path = os.path.join(video_base, "src_video_obj_1.mp4")
+            mask_path = os.path.join(video_base, "mask_obj_1.mp4")
             
             video_tensor = _load_frames_cv2(
                 video_path=video_path,
@@ -328,33 +321,41 @@ def main():
                 center_crop=args.center_crop,
                 target_dtype=model_dtype,
             )
+            T, H, W = video_tensor.shape[2:5]
             if not os.path.exists(src_video_path) or not os.path.exists(mask_path):
                 if args.vace_mode == "T2V":
-                    src_video_frames = np.zeros((video_tensor.shape[2], video_tensor.shape[3], video_tensor.shape[4], 3), dtype=np.uint8)
-                    mask_frames = np.ones((video_tensor.shape[2], video_tensor.shape[3], video_tensor.shape[4]), dtype=np.uint8)
+                    src_video_tensor = torch.zeros((1, 3, T, H, W), device=pipeline.device)
+                    mask_tensor = torch.ones((1, 1, T, H, W), device=pipeline.device).div(255.0)
                 elif args.vace_mode == "I2V":
                     #Read first frame from video as src_video and remaining frames as zeros
-                    src_video_frames = video_tensor[0, :, 0, :, :].permute(1, 2, 0).cpu().numpy() * 255.0
-                    src_video_frames = src_video_frames.astype(np.uint8)
-                    src_video_frames = np.expand_dims(src_video_frames, axis=0)
-                    zero_frames = np.zeros((video_tensor.shape[2]-1, video_tensor.shape[3], video_tensor.shape[4], 3), dtype=np.uint8)
-                    src_video_frames = np.concatenate([src_video_frames, zero_frames], axis=0)
-                    mask_frames = np.ones((video_tensor.shape[2], video_tensor.shape[3], video_tensor.shape[4]), dtype=np.uint8)
+                    src_video_tensor = torch.zeros((3, T, H, W), device=video_tensor.device, dtype=video_tensor.dtype)
+                    src_video_tensor[:, 0] = video_tensor[0, :, 0, :, :] # C, T, H, W
+                    src_video_tensor = src_video_tensor.unsqueeze(0).to(pipeline.device)  # 1, C, T, H, W
+                    mask_tensor = torch.ones((1, 1, T, H, W), device=pipeline.device).div(255.0)    # 1, 1, T, H, W
                 elif args.vace_mode == "V2V":
-                    print(f"Failed to context read frames for {video_name}")
+                    print(f"Failed to context read frames for {src_video_path}")
                     continue
             else:
-                src_video_frames = read_video_frames(src_video_path)
-                mask_frames = read_mask_frames(mask_path)
+                src_video_tensor = _load_frames_cv2(src_video_path,
+                                                    start_frame=start_frame,
+                                                    end_frame=end_frame,
+                                                    target_size=target_size,
+                                                    resize_mode=args.resize_mode,
+                                                    maintain_aspect_ratio=not args.no_aspect_ratio,
+                                                    center_crop=args.center_crop,
+                                                    target_dtype=model_dtype,
+                                                    ).to(pipeline.device) 
+                mask_tensor = _load_frames_cv2(mask_path,
+                                              start_frame=start_frame,
+                                              end_frame=end_frame,
+                                              target_size=target_size,
+                                              resize_mode=args.resize_mode,
+                                              maintain_aspect_ratio=not args.no_aspect_ratio,
+                                              center_crop=args.center_crop,
+                                              target_dtype=model_dtype,
+                                              is_mask=True
+                                              ).to(pipeline.device) 
             
-            src_video_tensor = torch.from_numpy(src_video_frames).float() / 255.0  # T, H, W, C
-            mask_tensor = torch.from_numpy(mask_frames).float() / 255.0    # T, H, W
-            src_video_tensor = src_video_tensor.permute(3, 0, 1, 2)  # C, T, H, W
-            mask_tensor = mask_tensor.unsqueeze(0)           # 1, T, H, W
-            
-            # VACE expects batch dimension, so add batch if needed
-            src_video_tensor = src_video_tensor.unsqueeze(0).to(pipeline.device)  # 1, C, T, H, W
-            mask_tensor = mask_tensor.unsqueeze(0).to(pipeline.device)    # 1, 1, T, H, W
             # Use pipeline to encode frames/masks and get vace_context
             text_embed = pipeline.text_encoder([prompt], pipeline.device)[0]
             latents = _encode_video_latents(
@@ -367,23 +368,8 @@ def main():
             mask0 = pipeline.vace_encode_masks(mask_tensor, ref_images=None)
             vace_context_latent = pipeline.vace_latent(vace_context0, mask0)[0]
             
-            # Patchify vace_context_latent to match expected 2D format [num_patches, c * pF * pH * pW]
-            # vace_context_latent shape: [c, F, H, W] -> need to reshape to [num_patches, c * pF * pH * pW]
-            c, F, H, W = vace_context_latent.shape
-            patch_temporal, patch_spatial = 1, 2  # Default patch sizes
-            pF, pH, pW = patch_temporal, patch_spatial, patch_spatial
-            
-            assert F % pF == 0 and H % pH == 0 and W % pW == 0, \
-                f"Dimensions ({F}, {H}, {W}) must be divisible by patch size ({pF}, {pH}, {pW})"
-            
-            F_patches, H_patches, W_patches = F // pF, H // pH, W // pW
-            
-            # Reshape and permute to get patchified format
-            vace_context_reshaped = vace_context_latent.reshape(c, F_patches, pF, H_patches, pH, W_patches, pW)
-            vace_context_reshaped = vace_context_reshaped.permute(1, 3, 5, 2, 4, 6, 0)  # [F_patches, H_patches, W_patches, pF, pH, pW, c]
-            num_patches = F_patches * H_patches * W_patches
-            vace_context_patchified = vace_context_reshaped.reshape(num_patches, c * pF * pH * pW)  # [num_patches, c * pF * pH * pW]
-            
+            vace_context_patchified = patchify([vace_context_latent], patch_size=(1,2,2))[0]
+
             # Move to CPU for saving and convert to float16 to reduce file size
             text_embed_cpu = text_embed.detach().cpu()
             latents_cpu = latents.detach().cpu()
